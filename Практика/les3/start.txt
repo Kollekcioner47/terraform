@@ -1,0 +1,241 @@
+1) Создадим папку проекта
+mkdir webserver
+внутри создадим файл
+default.tf
+в файде мы опишем нашего провайдера^
+________________________________________
+# Строим вебсервис
+# Опсание что мы используем в качестве провайдера, в нашем случае яндекс
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+  required_version = ">= 0.13"
+}
+locals {
+  cloud_id = "b1g6o28sojslu5i7ejuu"
+  folder_id = "b1girgsodhjtp9a0laq4"
+}
+# зададим в качаестве переменных наши ид облака и папки
+
+# зона создания ресурсов, в некоторых провайдерах указывается region
+provider "yandex" {
+  zone = "ru-central1-a"
+  cloud_id = local.cloud_id
+  folder_id = local.folder_id
+  service_account_key_file = "C:/tf_cloud/authorized_key.json"
+  }
+
+_________________________________________________
+
+2) Нам нужно создать IAM-токен для нашего сервис-аккаунта, в консоле ЯО выбираем наш сервис-аккаунт и там создаём этот ключ, его необходимо скачать и добавить в папку 
+проекта
+
+
+3) затем мы создадим файл main.tf и там опишем наши ресурсы
+аккаунт и бакет
+идйм в документацию https://terraform-provider.yandexcloud.net//Resources/storage_bucket и копируем в файо main.tf:
+
+______________________________________
+
+// Create SA
+resource "yandex_iam_service_account" "sa" {
+  folder_id = local.folder_id
+  name      = "tf-test-sa"
+}
+
+// Grant permissions
+resource "yandex_resourcemanager_folder_iam_member" "sa-editor" {
+  folder_id = local.folder_id
+  role      = "storage.editor"
+  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
+}
+
+// Create Static Access Keys
+resource "yandex_iam_service_account_static_access_key" "sa-static-key" {
+  service_account_id = yandex_iam_service_account.sa.id
+  description        = "static access key for object storage"
+}
+
+// Use keys to create bucket
+resource "yandex_storage_bucket" "test" {
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  bucket = "tf-test-bucket"
+}
+________________________________________
+
+4) в сам файл в самом начале добавим секцию переменных
+locals  {
+
+}
+
+Внутри секции обозначим переменные:
+bucket_name = "tf-website-lesson-bucker"
+
+В конце документа меняем им бакета на переменную 
+bucket = local.bucket_name
+
+Пробуем применить
+terraform apply
+удаляем
+terraform destroy
+
+5) далее добавляем сайт из документации бакета
+
+______________________________________
+
+  acl    = "public-read"
+
+  website {
+    index_document = "index"
+    error_document = "error"
+    routing_rules = <<EOF
+  }
+______________________________________
+index вынесем в переменную
+в блок locals добавим:
+index = "index.html"
+в блоке website поменяем 
+index_document = "index" на index_document = local.index
+
+нам нужно получить аутпут, добавим в конце:
+ output "site_name" {
+  value = yandex_storage_bucket.test.website_endpoint
+  
+}
+
+сохраняем и выполняем, получаем ошибку, поскольку acl    = "public-read"
+не позволяет загужать контент, нам нужно поменять права на 
+acl    = "public-admin"
+
+сохраняем и выполняем
+terraform apply
+
+переходим по полученному имени
+у нас нет сайта и мы увидим только информацию об этом
+
+6) нужно создать индексную страницу
+создаём папку site в каталоге проекта и создаём в ней index.html
+
+______________________________________
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My cat</title>
+</head>
+<body>
+    <h1> Hello, Cats! </h1>
+
+</body>
+</html>
+______________________________________
+
+
+открываем документацию yandex_storage_object
+и копируем пример кода в main.tf перед блоком output
+______________________________________
+resource "yandex_storage_object" "index" {
+  bucket = "cat-pictures"
+  key    = "cute-cat"
+  source = "/images/cats/cute-cat.jpg"
+  tags = {
+    test = "value"
+  }
+}
+______________________________________
+нам нужно сослаться на бакет, для этого мы меняем
+bucket = "cat-pictures" на 
+bucket = yandex_storage_bucket.test.id
+
+key    = "cute-cat" меняем на 
+key    = local.index
+
+source = "/images/cats/cute-cat.jpg" меняем на 
+source = "site/${local.index}"
+
+из блока resource "yandex_storage_bucket" "test" копируем 
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  acl = "public-read"
+в блок  resource "yandex_storage_object" "index"
+
+у вас должно получиться:
+______________________________________
+resource "yandex_storage_object" "index" {
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  acl = "public-read"
+  bucket = yandex_storage_bucket.test.id
+  key    = local.index
+  source = "site/${local.index}"
+  tags = {
+    test = "cats" 
+  }
+}
+______________________________________
+
+сохраняем и выполняем
+terraform apply
+
+добавляем картинку, в папке site создаём папку img
+добавляем туда любую картинку котика в формате png, под имененм cat.png
+копируем наш блок resource "yandex_storage_object" "index"
+меняем имя на img
+добавим чтение картинок циклом (просто, чтобы показать что можно и так)
+for_each = fileset("site", "img/*")
+
+key    = local.index меняем на 
+key = each.key
+
+source = "site/${local.index}" меняем на 
+source = "site/${each.key}"
+
+по итогу должно получиться так:
+______________________________________
+resource "yandex_storage_object" "index" {
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  acl = "public-read"
+  bucket = yandex_storage_bucket.test.id
+  key    = local.index
+  source = "site/${local.index}"
+  tags = {
+    test = "cats" 
+  }
+}
+
+resource "yandex_storage_object" "img" {
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  acl = "public-read"
+  bucket = yandex_storage_bucket.test.id
+  key = each.key
+  source = "site/${each.key}"
+  for_each = fileset("site", "img/*")
+  tags = {
+    test = "cats" 
+  }
+}
+______________________________________
+
+далее в index.html добавит тег на нашу картинку
+
+<p><img src="img/cat.png"></p>
+
+7) Так как terraform анализировать наш index.html и в случае изменения не 
+загрузит его заново просто так, нам нужно добавить функцию хэширования,
+чтобы terraform мог отличить одну версию сайта от другой
+
+в resource "yandex_storage_object" "index"
+заменяем source на 
+content_base64 = base64encode(file("site/${local.index}"))
+
+сохраняем и выполняем
+terraform apply
+
+идём на сайт и проверяем 

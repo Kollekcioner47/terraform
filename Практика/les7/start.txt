@@ -1,0 +1,61 @@
+Dynamic code
+
+Нам необходимо создать папку проекта, затем создать два файла:
+default.tf, где мы определяем параметры подключениея к облаку
+_____________________________
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+  required_version = ">= 0.13"
+}
+locals {
+  cloud_id = "b1g6o28sojslu5i7ejuu"
+  folder_id = "b1girgsodhjtp9a0laq4"
+}
+# зададим в качаестве переменных наши ид облака и папки
+
+# зона создания ресурсов, в некоторых провайдерах указывается region
+provider "yandex" {
+  zone = "ru-central1-a"
+  cloud_id = local.cloud_id
+  folder_id = local.folder_id
+  service_account_key_file = "C:/tf_cloud/authorized_key.json"
+  }
+_____________________________
+и файл main.tf, в котороый мы поместим код:
+_____________________________
+
+resource "yandex_vpc_network" "foo" {}
+
+resource "yandex_vpc_subnet" "foo" {
+  zone           = "ru-central1-a"
+  network_id     = "${yandex_vpc_network.foo.id}"
+  v4_cidr_blocks = ["10.5.0.0/24"]
+}
+resource "yandex_vpc_security_group" "my_webserver" {
+  name        = "My webserver group"
+  description = "description for my security group"
+  network_id  = "${yandex_vpc_network.foo.id}"
+
+  labels = {
+    my-label = "my-label-value"
+  }
+
+
+}
+_____________________________
+1) Для генерации кода добавляем над правилами:
+dynamic "ingress" {
+    for_each = ["80","443","1541","9092"]
+    content {
+        protocol       = "TCP"
+        v4_cidr_blocks = ["0.0.0.0/0"]
+        from_port      = ingress.value
+        to_port        = ingress.value
+    }
+А ручные правила удаляем, кроме egress
+Если вам ещё нужен VPN для подключения, лучше добавить ручное правило на ingress
+2) применяем и проверяем

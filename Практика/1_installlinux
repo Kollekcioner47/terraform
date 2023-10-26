@@ -1,0 +1,11 @@
+1) скачать исполняемый файл с terrform.io
+https://developer.hashicorp.com/terraform/downloads
+
+2) в терминале:
+перейти в папку загрузок
+unzip terraform-версия
+копируем в bin
+sudo mv terraform-версия /bin
+
+3) проверяем работу:
+terraform --version

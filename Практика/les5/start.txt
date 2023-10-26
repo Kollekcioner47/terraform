@@ -1,0 +1,122 @@
+Вебсервис
+
+Нам необходимо создать папку проекта, затем создать два файла:
+default.tf, где мы определяем параметры подключениея к облаку
+_____________________________
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+  required_version = ">= 0.13"
+}
+locals {
+  cloud_id = "b1g6o28sojslu5i7ejuu"
+  folder_id = "b1girgsodhjtp9a0laq4"
+}
+# зададим в качаестве переменных наши ид облака и папки
+
+# зона создания ресурсов, в некоторых провайдерах указывается region
+provider "yandex" {
+  zone = "ru-central1-a"
+  cloud_id = local.cloud_id
+  folder_id = local.folder_id
+  service_account_key_file = "C:/tf_cloud/authorized_key.json"
+  }
+_____________________________
+
+1) Создаём файл webserver.tf, в котороый помещаем стандартный compute instance
+ _____________________________
+ resource "yandex_compute_instance" "webserver" {
+  name        = "test"
+  platform_id = "standard-v1"
+  zone        = "ru-central1-a"
+
+
+  resources {
+    cores  = 2
+    memory = 4
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = "fd807ed79a4kkqfvd1mb"
+    }
+  }
+
+  network_interface {
+    subnet_id = "${yandex_vpc_subnet.foo.id}"
+    nat = true
+    # добавляем после шага 2
+#  security_group_ids = [yandex_vpc_security_group.my_webserver.id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:${file("~/.ssh/id_rsa.pub")}"
+  }
+}
+
+resource "yandex_vpc_network" "foo" {}
+
+resource "yandex_vpc_subnet" "foo" {
+  zone           = "ru-central1-a"
+  network_id     = "${yandex_vpc_network.foo.id}"
+  v4_cidr_blocks = ["10.5.0.0/24"]
+}
+
+output "internal_ip_address_webserver" {
+  value = yandex_compute_instance.webserver.network_interface.0.ip_address
+}
+
+
+output "external_ip_address_webserver" {
+  value = yandex_compute_instance.webserver.network_interface.0.nat_ip_address
+}
+_____________________________
+
+2) там же добавляем новый ресурс security groups
+_____________________________
+
+resource "yandex_vpc_security_group" "my_webserver" {
+  name        = "My webserver group"
+  description = "description for my security group"
+  network_id  = "${yandex_vpc_network.foo.id}"
+
+  labels = {
+    my-label = "my-label-value"
+  }
+
+  ingress {
+    protocol       = "ANY"
+    description    = "rule1 description"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+    from_port      = 80
+    to_port        = 80
+  }
+
+  egress {
+    protocol       = "ANY"
+    description    = "rule2 description"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+    from_port      = 80
+    to_port        = 80
+  }
+}
+
+_____________________________
+#! не работает в яндекс
+3) добавляем в папке проекта bash-скрипт под названием script.sh
+_____________________________
+
+#!/bin/bash
+sudo apt update -y
+sudo apt install apache2 -y
+myip=`curl http://169.254.169.254/latest/meta-data/public-ipv4`
+echo "<h2> My WebServer with IP: $myip</h2><br> Build by Terraform" | sudo tee /var/www/html/index.html
+sudo service apache2 restart
+
+_____________________________
+
+4) в блоке metadata webserver.tf добавляем ссылку на файл
+user_data = file("script.sh")

@@ -1,0 +1,108 @@
+1) Регистрируемся на яндекс и яндекс клауд
+2) создаём папку на диске, в которой будем работать, например c:\terraform
+или /home/user/terraform
+3) скачиваем яндекс cli https://cloud.yandex.ru/docs/cli/quickstart#install
+3) в папке через powershell или терминал 
+4) запускаем инициализацию
+yc init
+следуем инструкции
+5) запускаем 
+yc iam key create \
+  --service-account-id <идентификатор_сервисного_аккаунта> \
+  --folder-name <имя_каталога_с_сервисным_аккаунтом> \
+  --output key.json
+
+результат обязательно сохраняем в файл.
+6) Создайте профиль CLI для выполнения операций от имени сервисного аккаунта. Укажите имя профиля:
+yc config profile create <имя_профиля>
+7) Задайте конфигурацию профиля:
+yc config set service-account-key key.json
+yc config set cloud-id <идентификатор_облака>
+yc config set folder-id <идентификатор_каталога>  
+8) Добавьте аутентификационные данные в переменные окружения:
+BASH:
+export YC_TOKEN=$(yc iam create-token)
+export YC_CLOUD_ID=$(yc config get cloud-id)
+export YC_FOLDER_ID=$(yc config get folder-id)
+или
+powershell:
+$Env:YC_TOKEN=$(yc iam create-token)
+$Env:YC_CLOUD_ID=$(yc config get cloud-id)
+$Env:YC_FOLDER_ID=$(yc config get folder-id)
+
+9) Создайте файл конфигурации Terraform
+Создайте в новой директории конфигурационный файл с расширением .tf, например main.tf.
+
+# Каждый файл конфигурации должен быть в отдельной папке!
+Windows:
+Создайте файл конфигурации Terraform CLI terraform.rc в папке %APPDATA% вашего пользователя.
+Linux:
+nano ~/.terraformrc
+
+и добавьте в ваш файл код:
+provider_installation {
+  network_mirror {
+    url = "https://terraform-mirror.yandexcloud.net/"
+    include = ["registry.terraform.io/*/*"]
+  }
+  direct {
+    exclude = ["registry.terraform.io/*/*"]
+  }
+}
+
+Создадим первый ресурс:
+По плану будут созданы следующие ресурсы:
+
+Облачная сеть network-1 с подсетью subnet-1 в зоне доступности ru-central1-a.
+Две виртуальные машины Linux: terraform1 (2 ядра и 2 ГБ оперативной памяти) и terraform2 (4 ядра и 4 ГБ оперативной памяти). Они автоматически получат публичные и приватные IP-адреса из диапазона 192.168.10.0/24 в подсети subnet-1.
+Получите идентификатор образа загрузочного диска из Yandex Cloud Marketplace, например Ubuntu 16.04 LTS, который будет установлен на ВМ. Получите список доступных публичных образов, выполнив следующую команду CLI:
+
+yc compute image list --folder-id standard-images
+
+нужно сгенерировать ssh-ключи для доступа к машинам
+ssh-keygen -t ed25519
+
+сам файл смотри в lesson1.tf
+
+В консоли запускаем terraform init для проверки валидности
+
+далее запускаем terraform plan
+тф покажет что он создаст по вашему сценарию
+
+terraform apply создаст ваши ресурсы
+при запуске ТФ спросит точно ли вы уверены в создании ресурсов, нужно ответить yes в консоль
+
+если мы запустим terraform apply ещё раз, то на ТФ проверит, соответствует ли ресурс его файлу, если да, то изменений не будет, если мы, например, 
+добавим в файл ещё один ресурс, то старый ресурс ТФ оставит без изменений, но добавит ещё один ресурс, проверьте это с помощью файла lesson1-2.tf
+
+
+
+проверяем в консоли яндекса наши ресурсы, после не забываем всё уничтожить командой 
+terraform destroy
+
+Чтобы добавить пользователя на создаваемую ВМ, в блоке metadata укажите параметр user-data с пользовательскими метаданными. Для этого:
+
+Создайте текстовый файл с метаданными в кодировке UTF-8, например:
+
+#cloud-config
+users:
+  - name: <имя_пользователя>
+    groups: sudo
+    shell: /bin/bash
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    ssh-authorized-keys:
+      - <публичный_SSH-ключ_1>
+      - <публичный_SSH-ключ_2>
+      - ...
+Где:
+
+name — имя пользователя ВМ.
+
+ssh-authorized-keys (также допустим вариант ssh_authorized_keys) — список публичных SSH-ключей для доступа к ВМ.
+
+Пример ключа: ssh-ed25519 AAAAB3Nza......Pu00jRN user@desktop.
+
+
+первый урок законен
+
+

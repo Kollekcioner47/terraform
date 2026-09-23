@@ -1,0 +1,121 @@
+k8s
+
+Нам необходимо создать папку проекта, затем создать файлы:
+default.tf, где мы определяем параметры подключениея к облаку
+_____________________________
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+  required_version = ">= 0.13"
+}
+locals {
+  cloud_id = "b1g6o28sojslu5i7ejuu"
+  folder_id = "b1girgsodhjtp9a0laq4"
+}
+# зададим в качаестве переменных наши ид облака и папки
+
+# зона создания ресурсов, в некоторых провайдерах указывается region
+provider "yandex" {
+  zone = "ru-central1-a"
+  cloud_id = local.cloud_id
+  folder_id = local.folder_id
+  service_account_key_file = "C:/tf_cloud/authorized_key.json"
+  }
+_____________________________
+
+1) Создайте файл main.tf
+Подключите модуль управления виртуальными сетями
+Добавьте в конфигурацию модуль terraform-yc-vpc — с его помощью можно управлять сетевой инфраструктурой вашего облака: сетями, подсетями, шлюзами и другими объектами Virtual Private Cloud. Создайте тестовую сеть с тремя подсетями в разных зонах доступности:
+_____________________________
+module "yc-vpc" {
+  source              = "git@github.com:terraform-yc-modules/terraform-yc-vpc.git"
+  network_name        = "test-module-network"
+  network_description = "Test network created with module"
+  private_subnets = [{
+    name           = "subnet-1"
+    zone           = "ru-central1-a"
+    v4_cidr_blocks = ["10.10.0.0/24"]
+  },
+  {
+    name           = "subnet-2"
+    zone           = "ru-central1-b"
+    v4_cidr_blocks = ["10.11.0.0/24"]
+  },
+  {
+    name           = "subnet-3"
+    zone           = "ru-central1-c"
+    v4_cidr_blocks = ["10.12.0.0/24"]
+  }
+  ]
+}
+_____________________________
+Подключите модуль Managed Service for Kubernetes
+Добавьте в конфигурацию модуль terraform-yc-vpc и конфигурацию кластера Managed Service for Kubernetes с региональным мастером и двумя группами узлов:
+_____________________________
+module "kube" {
+  source     = "git@github.com:terraform-yc-modules/terraform-yc-kubernetes.git"
+  network_id = "${module.yc-vpc.vpc_id}"
+
+  master_locations  = [
+    for s in module.yc-vpc.private_subnets:
+      {
+        zone      = s.zone,
+        subnet_id = s.subnet_id
+      }
+    ]
+
+  master_maintenance_windows = [
+    {
+      day        = "monday"
+      start_time = "23:00"
+      duration   = "3h"
+    }
+  ]
+
+  node_groups = {
+    "yc-k8s-ng-01"  = {
+      description   = "Kubernetes nodes group 01"
+      fixed_scale   = {
+        size = 3
+      }
+      node_labels   = {
+        role        = "worker-01"
+        environment = "testing"
+      }
+    },
+
+    "yc-k8s-ng-02"  = {
+      description   = "Kubernetes nodes group 02"
+      auto_scale    = {
+        min         = 2
+        max         = 4
+        initial     = 2
+      }
+      node_labels   = {
+        role        = "worker-02"
+        environment = "dev"
+      }
+
+      max_expansion   = 1
+      max_unavailable = 1
+    }
+  }
+}
+_____________________________
+Проверьте и отформатируйте файлы конфигураций
+Проверьте конфигурацию командой:
+
+terraform validate
+Если конфигурация является допустимой, появится сообщение:
+
+Success! The configuration is valid.
+Отформатируйте файлы конфигураций в текущем каталоге и подкаталогах:
+
+terraform fmt
+Результат:
+
+main.tf
+variables.tf

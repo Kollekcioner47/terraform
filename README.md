@@ -1,4 +1,5 @@
 # Практическое использование Terraform в Яндекс Облаке
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/364903c4-ccff-4be2-b478-cd97272fc0aa" />
 
 > Практический учебный курс по Terraform с инфраструктурой в Яндекс Облаке.
 

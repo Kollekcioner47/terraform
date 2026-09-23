@@ -1,0 +1,27 @@
+# Пример значений переменных практики 7.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+storage_access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+storage_secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+
+project_name = "tf-k8s"
+
+# Кластер Kubernetes: мастер платный круглосуточно и создаётся
+# 10-15 минут. Держите включённым только на время занятия.
+create_cluster = false
+master_type    = "zonal"    # zonal — дешевле, regional — отказоустойчивее
+k8s_version    = ""         # пусто — версия по умолчанию
+
+node_count  = 1
+node_cores  = 2
+node_memory = 4
+
+# Функция и шлюз API: стоят копейки, можно оставлять включёнными.
+create_serverless  = true
+function_runtime   = "python312"
+function_memory    = 128

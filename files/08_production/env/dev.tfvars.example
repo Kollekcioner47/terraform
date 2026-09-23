@@ -1,0 +1,27 @@
+# Значения переменных для окружения DEV.
+#
+# Передаётся при запуске:
+#   terraform apply -var-file=env/dev.tfvars
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+storage_access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+storage_secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+
+environment  = "dev"
+project_name = "tf-final"
+
+# В dev: машина прерываемая, экономная, защита выключена.
+create_app   = true
+app_cores    = 2
+app_memory   = 2
+preemptible  = true
+
+# Имя бакета уникально во всём Object Storage — добавьте своё.
+site_bucket = "tf-final-dev-site-ivan"
+
+protect_resources = false

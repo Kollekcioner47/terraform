@@ -1,0 +1,30 @@
+# Пример значений переменных практики 6.
+#
+# ВНИМАНИЕ: этот файл не попадает в репозиторий (см. .gitignore),
+# но и в нём пароль в открытом виде — компромисс учебного стенда.
+# В рабочей среде пароль берут из хранилища секретов или из переменной
+# окружения TF_VAR_db_password, которую подставляет система запуска.
+
+cloud_id    = "b1gXXXXXXXXXXXXXXX"
+folder_id   = "b1gYYYYYYYYYYYYYYY"
+zone        = "ru-central1-d"
+sa_key_file = "/home/user/.yc/tf-course-key.json"
+
+project_name = "tf-data"
+
+# Имя бакета уникально во всём Object Storage — добавьте своё.
+bucket_name = "tf-course-site-ivan-2026"
+
+# Секрет и пароль базы данных.
+create_secret = true
+db_password   = "Zayac-47-Polyana"
+
+db_name = "appdb"
+db_user = "appuser"
+
+# Кластер базы данных. Включён — значит платно: держите включённым
+# только на время разбора и не забудьте выключить или удалить.
+create_database = false
+db_version      = "17"
+db_preset       = "s2.micro"
+db_disk_size    = 10

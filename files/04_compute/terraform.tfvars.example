@@ -1,0 +1,25 @@
+# Пример значений переменных практики 4.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-compute"
+
+# Веб-сервер.
+web_vm_cores  = 2
+web_vm_memory = 2
+
+# Дополнительный диск и снимок.
+data_disk_type = "network-hdd"
+data_disk_size = 5
+create_snapshot = true
+
+# Группа машин: сначала фиксированное число, потом попробуйте
+# включить автоматическое масштабирование.
+ig_size        = 2
+ig_autoscaling = false
+
+create_load_balancer = true

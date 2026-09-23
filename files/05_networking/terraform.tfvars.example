@@ -1,0 +1,37 @@
+# Пример значений переменных практики 5.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-net"
+
+# Подсети в трёх зонах. Зона ru-central1-c больше не существует;
+# актуальны a, b, d (рекомендуемая для новых проектов) и e.
+subnets = {
+  web-a = {
+    zone = "ru-central1-a"
+    cidr = "10.70.10.0/24"
+  }
+  web-b = {
+    zone = "ru-central1-b"
+    cidr = "10.70.20.0/24"
+  }
+  web-d = {
+    zone = "ru-central1-d"
+    cidr = "10.70.30.0/24"
+  }
+}
+
+web_ports = [80]
+
+# Своя доменная зона. Для занятий годится любое имя, но помните:
+# пока домен не делегирован облаку у регистратора, зона не работает
+# в интернете. Если у вас есть свой домен — укажите его.
+dns_zone        = "tf-course.example.com."
+dns_record_name = "web"
+
+create_alb         = true
+enable_nat_gateway = true

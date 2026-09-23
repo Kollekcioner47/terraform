@@ -1,0 +1,64 @@
+#cloud-config
+# Начальная настройка виртуальной машины.
+#
+# Этот файл передаётся в облако в метаданных (аргумент user-data)
+# и исполняется агентом cloud-init при первом запуске машины.
+#
+# Что здесь важно:
+#   * формат — YAML, первая строка #cloud-config обязательна;
+#   * отступы только пробелами, табуляция ломает разбор;
+#   * файл читается ОДИН РАЗ при первой загрузке. Изменения в этом
+#     файле не применяются к уже работающей машине: чтобы увидеть
+#     новый вариант, машину нужно пересоздать;
+#   * ошибки в cloud-init не останавливают создание машины — она
+#     поднимется, но без настройки. Смотреть журнал:
+#       sudo cat /var/log/cloud-init-output.log
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Учебный веб-сервер</title>
+      </head>
+      <body>
+        <h1>Веб-сервер создан Terraform</h1>
+        <p>Страница записана файлом cloud-init.</p>
+      </body>
+      </html>
+
+runcmd:
+  # Внешний адрес машины из службы метаданных Яндекс Облака.
+  #
+  # ВАЖНО: это НЕ тот адрес, что используется в AWS
+  # (169.254.169.254/latest/meta-data/...). В Яндекс Облаке служба
+  # метаданных отвечает по пути computeMetadata/v1 и требует заголовок
+  # Metadata-Flavor: Google. Запрос без этого заголовка вернёт ошибку.
+  - |
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/hostname)
+
+    printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP" >> /var/www/html/index.html
+    printf '<p>Внутренний адрес: %s</p>\n' "$INTERNAL_IP" >> /var/www/html/index.html
+    printf '<p>Имя машины: %s</p>\n' "$HOSTNAME" >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx
+
+# Отдельный файл со признаком того, что настройка дошла до конца.
+# Удобно для проверок: если файла нет — cloud-init не доработал.
+final_message: "Настройка завершена за $UPTIME секунд"

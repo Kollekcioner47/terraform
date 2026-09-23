@@ -1,0 +1,66 @@
+#cloud-config
+# Начальная настройка веб-сервера.
+#
+# Формат и правила те же, что в практике 4: первая строка #cloud-config,
+# отступы только пробелами, файл читается один раз при первой загрузке,
+# ошибки видны только в журнале на самой машине.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Практика 5: сети</title>
+      </head>
+      <body>
+        <h1>Веб-сервер за прикладным балансировщиком</h1>
+        <p>Адреса подставлены скриптом cloud-init из службы метаданных.</p>
+      </body>
+      </html>
+
+runcmd:
+  # Адреса берём из службы метаданных Яндекс Облака.
+  # Заголовок Metadata-Flavor: Google обязателен, а путь отличается
+  # от пути в AWS (подробно — в практике 4).
+  - |
+    META=http://169.254.169.254/computeMetadata/v1/instance
+
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/access-configs/0/external-ip")
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/ip")
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" "$META/hostname")
+    ZONE=$(curl -s -H "Metadata-Flavor: Google" "$META/zone")
+
+    # ВНИМАНИЕ: идентификатор подсети лежит в ключе с именем network.
+    # Ключа subnet-id в службе метаданных нет, и запрос по нему
+    # возвращает «Not Found» — мы это проверили на живом стенде.
+    #
+    # Посмотреть, какие ключи есть на самом деле, можно так:
+    #   curl -s -H "Metadata-Flavor: Google" \
+    #     http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/
+    SUBNET=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/network")
+
+    {
+      printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP"
+      printf '<p>Внутренний адрес: %s</p>\n' "$INTERNAL_IP"
+      printf '<p>Имя машины: %s</p>\n' "$HOSTNAME"
+      printf '<p>Зона доступности: %s</p>\n' "${ZONE##*/}"
+      printf '<p>Подсеть: %s</p>\n' "$SUBNET"
+    } >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx
+
+final_message: "Веб-сервер готов за $UPTIME секунд"

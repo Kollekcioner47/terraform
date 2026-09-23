@@ -1,0 +1,13 @@
+# Настройки хранилища состояния для окружения DEV.
+#
+# Передаются при инициализации:
+#   terraform init -backend-config=env/backend-dev.tfvars
+
+bucket = "tf-course-state-ivan"
+
+# Ключ состояния включает окружение. Именно это делает состояния
+# независимыми: изменения в dev не видят ресурсы prod и наоборот.
+key = "final/dev/terraform.tfstate"
+
+access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"

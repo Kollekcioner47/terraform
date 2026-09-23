@@ -1,0 +1,15 @@
+# Настройки хранилища состояния для окружения PROD.
+#
+# Передаются при инициализации:
+#   terraform init -backend-config=env/backend-prod.tfvars
+#
+# ВАЖНО: если у вас несколько окружений, для prod обычно берут
+# ОТДЕЛЬНЫЙ бакет и ОТДЕЛЬНЫЙ сервисный аккаунт с правами только
+# на него. Тогда ошибка в конвейере dev не сможет испортить prod.
+
+bucket = "tf-course-state-prod"
+
+key = "final/prod/terraform.tfstate"
+
+access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"

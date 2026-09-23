@@ -1,0 +1,53 @@
+#cloud-config
+# Начальная настройка машины итогового стенда.
+#
+# Минимум, который делает машину рабочей: веб-сервер и страница,
+# которая показывает, в каком окружении она работает.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Итоговый стенд</title>
+      </head>
+      <body>
+        <h1>Стенд поднят Terraform</h1>
+        <p>Окружение: ${environment}</p>
+        <p>Страница создана файлом cloud-init.</p>
+      </body>
+      </html>
+
+runcmd:
+  - |
+    META=http://169.254.169.254/computeMetadata/v1/instance
+
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/access-configs/0/external-ip")
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" "$META/hostname")
+    ZONE=$(curl -s -H "Metadata-Flavor: Google" "$META/zone")
+
+    {
+      printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP"
+      printf '<p>Имя машины: %s</p>\n' "$HOSTNAME"
+
+      # Зона приходит полным путём вида projects/<облако>/zones/<зона>,
+      # поэтому обрезаем его до имени зоны.
+      # Подстановка записана с удвоенным долларом — это шаблон
+      # Terraform, и одиночная запись была бы принята за переменную
+      # Terraform, а не bash. Подробности — в app.tf.
+      printf '<p>Зона: %s</p>\n' "$${ZONE##*/}"
+    } >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx

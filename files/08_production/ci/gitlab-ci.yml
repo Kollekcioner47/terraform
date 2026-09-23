@@ -1,0 +1,134 @@
+# Конвейер для Terraform: GitLab CI.
+#
+# Логика конвейера, которую стоит запомнить, одинакова для любой
+# системы — GitLab CI, GitHub Actions, Jenkins:
+#
+#   1. ПРОВЕРКА (validate): форматирование, валидация, линтер.
+#      Быстро, без облака, на каждый коммит.
+#   2. ПЛАН (plan): что именно изменится. Публикуется в обсуждение
+#      merge request — это то, что читает человек.
+#   3. ПРИМЕНЕНИЕ (apply): только вручную и только из защищённой
+#      ветки, после того как план прочитан и одобрен.
+#
+# Ключевые правила, без которых конвейер опасен:
+#   * apply НИКОГДА не запускается на каждый коммит в ветку;
+#   * план, который читал человек, и применённый план — один и тот же
+#     файл (terraform plan -out);
+#   * секреты (ключи доступа) лежат в защищённых переменных CI,
+#     а не в репозитории.
+
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  # Версия Terraform фиксируется: «последняя доступная» однажды
+  # станет другой и сломает конвейер без изменений в коде.
+  TF_VERSION: "1.16.4"
+
+  # Ключи доступа к Object Storage — из защищённых переменных CI.
+  # В настройках проекта: Settings → CI/CD → Variables, флажок
+  # Masked для секрета.
+  AWS_ACCESS_KEY_ID: "$TF_STORAGE_ACCESS_KEY"
+  AWS_SECRET_ACCESS_KEY: "$TF_STORAGE_SECRET_KEY"
+
+  # Значения переменных Terraform можно передавать переменными
+  # окружения — все они начинаются с TF_VAR_.
+  TF_VAR_cloud_id: "$YC_CLOUD_ID"
+  TF_VAR_folder_id: "$YC_FOLDER_ID"
+
+default:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  cache:
+    key: terraform-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .terraform/
+
+# ------------------------------------------------------------------
+# ПРОВЕРКА
+# ------------------------------------------------------------------
+
+fmt:
+  stage: validate
+  script:
+    - terraform fmt -check -recursive
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+validate:
+  stage: validate
+  script:
+    # init нужен и для проверки: без него validate не знает провайдеров.
+    - terraform init -backend=false -input=false
+    - terraform validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Тесты конфигурации. Работают без облака: провайдер замокирован.
+test:
+  stage: validate
+  script:
+    - terraform init -backend=false -input=false
+    - terraform test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ------------------------------------------------------------------
+# ПЛАН
+# ------------------------------------------------------------------
+
+plan:
+  stage: plan
+  script:
+    # Ключ доступа к состоянию передаётся файлом переменных бэкенда.
+    - terraform init -input=false
+      -backend-config="access_key=${AWS_ACCESS_KEY_ID}"
+      -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -backend-config="bucket=${TF_STATE_BUCKET}"
+      -backend-config="key=${TF_STATE_KEY}"
+
+    - terraform plan -input=false -lock-timeout=5m -out=plan.tfplan
+
+    # Сохраняем план: применён будет именно он, а не «что-то
+    # похожее, посчитанное заново».
+    - terraform show -no-color plan.tfplan > plan.txt
+  artifacts:
+    paths:
+      - plan.tfplan
+      - plan.txt
+    expire_in: 1 day
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ------------------------------------------------------------------
+# ПРИМЕНЕНИЕ
+# ------------------------------------------------------------------
+
+apply:
+  stage: apply
+  script:
+    - terraform init -input=false
+      -backend-config="access_key=${AWS_ACCESS_KEY_ID}"
+      -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -backend-config="bucket=${TF_STATE_BUCKET}"
+      -backend-config="key=${TF_STATE_KEY}"
+
+    # Применяем сохранённый план, а не новый: то, что одобрили, то и получится.
+    - terraform apply -input=false -auto-approve plan.tfplan
+  dependencies:
+    - plan
+  # Ручной запуск: применение инфраструктуры — не автоматическое действие.
+  when: manual
+  allow_failure: false
+  environment:
+    name: production
+  rules:
+    # Только из основной ветки и только вручную.
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual

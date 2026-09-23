@@ -1,0 +1,30 @@
+# Настройка зеркала провайдеров Яндекс Облака.
+#
+# Куда положить файл:
+#   Linux, macOS: ~/.terraformrc
+#   Windows:      %APPDATA%\terraform.rc
+#
+# Зачем он нужен: Terraform по умолчанию скачивает провайдеры
+# из публичного реестра registry.terraform.io. Зеркало Яндекс Облака
+# отдаёт те же провайдеры быстрее и работает там, где публичный
+# реестр недоступен.
+#
+# ВАЖНО: зеркал у Яндекса два, и они разные.
+#   * terraform-mirror.yandexcloud.net — провайдеры (этот файл);
+#   * hashicorp-releases.yandexcloud.net — дистрибутив самого Terraform.
+# Их часто путают: адрес для скачивания Terraform в terraform.rc
+# не подходит и наоборот.
+
+provider_installation {
+  # Все провайдеры, кроме yandex-cloud, тоже берутся с зеркала:
+  # оно проксирует публичный реестр.
+  network_mirror {
+    url     = "https://terraform-mirror.yandexcloud.net/"
+    include = ["registry.terraform.io/*/*"]
+  }
+
+  # Прямая установка остаётся только для всего, что не покрыто зеркалом.
+  direct {
+    exclude = ["registry.terraform.io/*/*"]
+  }
+}

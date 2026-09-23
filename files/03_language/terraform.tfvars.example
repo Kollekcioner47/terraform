@@ -1,0 +1,36 @@
+# Пример значений переменных практики 3.
+#
+# Скопируйте в terraform.tfvars и подставьте свои значения.
+# Обратите внимание: почти всё остальное у переменных имеет значения
+# по умолчанию, поэтому файл короткий.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-lang"
+environment  = "dev"
+
+# Дополнительные метки добавляются к общим (locals.common_labels).
+extra_labels = {
+  owner = "ivan"
+}
+
+# Машины ролей. Ключ словаря попадает в имя ресурса и в его метку роли.
+instances = {
+  app = {
+    subnet = "app"
+  }
+  queue = {
+    subnet = "data"
+    cores  = 2
+    memory = 4
+  }
+}
+
+# Число машин-исполнителей, создаваемых через count.
+worker_count = 1
+
+# Включите, если нужна отладочная машина.
+enable_debug_vm = false

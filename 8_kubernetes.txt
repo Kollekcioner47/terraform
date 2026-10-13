@@ -1,0 +1,1338 @@
+ПРАКТИКА 8. KUBERNETES ВЖИВУЮ
+
+Продолжительность: 1 академический час.
+Провайдер: yandex-cloud/yandex. Практика выполняется в Яндекс Облаке.
+
+ЧТО БУДЕТ К КОНЦУ ПРАКТИКИ
+
+  Вы создадите кластер Managed Service for Kubernetes с группой
+  узлов, подключитесь к нему через kubectl, запустите в нём
+  приложение и удалите всё созданное. По дороге разберёте, какие
+  роли нужны кластеру и почему без них он не поднимется, чем
+  зональный мастер отличается от регионального и почему подсеть
+  для мастера надо выбирать по зоне, а не по имени.
+
+ЧТО НУЖНО ЗАРАНЕЕ
+
+  * Практики 1–5: доступ, состояние, модули, машины, сети.
+    Модуль сети понадобится из практики 3.
+  * Практика 7: реестр образов — узлы забирают образы оттуда.
+    Практика 6 (данные и секреты) для этой практики не нужна.
+  * Клиент kubectl на рабочей машине.
+  * Понадобится 10–15 минут ожидания: мастер создаётся не мгновенно.
+
+ПРЕДУПРЕЖДЕНИЕ ПРО ДЕНЬГИ И ВРЕМЯ
+
+  МАСТЕР КЛАСТЕРА ПЛАТНЫЙ КРУГЛОСУТОЧНО — независимо от того,
+  работают ли узлы. И создаётся он 10–15 минут. Поэтому в конфигурации
+  кластер выключен переменной create_cluster: включайте его на время
+  разбора и удаляйте сразу после. Раздел «УБОРКА» в этой практике —
+  не формальность, а самая важная часть практики.
+
+  УЗЛЫ — обычные машины, за них платят как за машины. Мы делаем их
+  прерываемыми, чтобы снизить цену.
+
+
+------------------------------------------------------------------
+0. КАТАЛОГ ПРОЕКТА И ФАЙЛЫ
+------------------------------------------------------------------
+
+Кластер — отдельный проект со своим состоянием: у него своя
+сеть, свои сервисные аккаунты и свой жизненный цикл. Смешивать его
+с реестром из практики 7 не стоит: удаляя кластер, вы не должны
+рисковать реестром и функцией.
+
+  mkdir -p ~/terraform-course/work/08-kubernetes
+  cd ~/terraform-course/work/08-kubernetes
+
+СТРУКТУРА ПРОЕКТА
+
+  08-kubernetes/
+  ├── k8s.tf
+  ├── network.tf
+  ├── outputs.tf
+  ├── provider.tf
+  ├── terraform.tfvars.example
+  ├── variables.tf
+  └── versions.tf
+
+  ../modules/vpc/          общий модуль сети (создан в практике 3)
+    ├── main.tf
+    ├── outputs.tf
+    ├── variables.tf
+    └── versions.tf
+
+Первый файл — variables.tf. В нём все входные переменные практики:
+и те, что нужны провайдеру, и те, что управляют кластером. Значения
+по умолчанию подобраны так, чтобы случайный apply не создал платный
+мастер.
+
+cat > variables.tf <<'EOF'
+# Переменные практики 8: кластер Managed Service for Kubernetes
+# и группа узлов.
+#
+# Переменных меньше, чем в практике 7, но каждая дороже: значение
+# create_cluster включает платный мастер, а node_count — платные
+# машины узлов. Значения по умолчанию выбраны так, чтобы случайный
+# apply не стоил денег.
+
+variable "cloud_id" {
+  type        = string
+  description = "Идентификатор облака"
+}
+
+variable "folder_id" {
+  type        = string
+  description = "Идентификатор каталога"
+}
+
+# Зона, в которой размещаются мастер и узлы.
+#
+# Подсеть для мастера выбирается ПО ЭТОЙ ЗОНЕ (см. network.tf):
+# если в сети нет подсети такой зоны, Terraform остановится
+# с понятным сообщением, а не будет создавать кластер в чужой зоне.
+variable "zone" {
+  type        = string
+  description = "Зона размещения мастера и узлов"
+  default     = "ru-central1-d"
+}
+
+variable "sa_key_file" {
+  type        = string
+  description = "Путь к авторизованному ключу сервисного аккаунта"
+}
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Путь к публичному SSH-ключу (доступ к узлам кластера)"
+}
+
+variable "project_name" {
+  type        = string
+  description = "Префикс в именах ресурсов"
+  default     = "tf-k8s"
+}
+
+# ------------------------------------------------------------------
+# Kubernetes
+# ------------------------------------------------------------------
+
+# Создавать ли кластер Managed Service for Kubernetes.
+#
+# По умолчанию ВЫКЛЮЧЕНО, и это осознанно: мастер кластера платный
+# круглосуточно, а создаётся он 10-15 минут. Включайте на время
+# разбора, затем выключайте и удаляйте.
+variable "create_cluster" {
+  type        = bool
+  description = "Создавать ли кластер Managed Service for Kubernetes"
+  default     = false
+}
+
+# Тип мастера: zonal (один мастер, дешевле) или regional
+# (три мастера в трёх зонах, отказоустойчивый).
+variable "master_type" {
+  type        = string
+  description = "Тип мастера: zonal или regional"
+  default     = "zonal"
+
+  validation {
+    condition     = contains(["zonal", "regional"], var.master_type)
+    error_message = "Тип мастера: zonal или regional."
+  }
+}
+
+variable "k8s_version" {
+  type        = string
+  description = "Версия Kubernetes (пустая строка — версия по умолчанию)"
+  default     = ""
+}
+
+variable "node_count" {
+  type        = number
+  description = "Число узлов в группе"
+  default     = 1
+
+  validation {
+    condition     = var.node_count >= 0 && var.node_count <= 3
+    error_message = "Для учебного стенда: от 0 до 3 узлов."
+  }
+}
+
+variable "node_cores" {
+  type        = number
+  description = "Ядра узла"
+  default     = 2
+}
+
+variable "node_memory" {
+  type        = number
+  description = "Память узла, ГБ"
+  default     = 4
+}
+EOF
+
+КАК СОЗДАЁМ ФАЙЛЫ
+
+  Файлы можно набрать по тексту практики. Конструкция
+  cat > имя-файла <<'EOF' записывает в файл всё, что введено до
+  строки EOF, поэтому такой блок можно скопировать в терминал
+  целиком. Строки cat и EOF стоят в первом столбце: отступ сломал
+  бы завершение ввода.
+
+  Готовые файлы практики лежат в материалах курса — их можно
+  взять вместо набора по тексту:
+
+    cp -r ~/terraform-course/files/08_kubernetes/. .
+    mkdir -p ../modules
+    cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+  Вторая команда копирует общий модуль сети: в конфигурациях он
+  подключается как source = "../modules/vpc", то есть лежит рядом
+  с каталогом практики, в каталоге work/modules/vpc. Без модуля
+  terraform init остановится с ошибкой:
+
+    Error: Unreadable module directory
+    Error: Module not installed
+
+
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.3"
+
+  required_providers {
+    yandex = {
+      source  = "yandex-cloud/yandex"
+      version = "~> 0.229.0"
+    }
+  }
+}
+EOF
+
+cat > provider.tf <<'EOF'
+provider "yandex" {
+  cloud_id                 = var.cloud_id
+  folder_id                = var.folder_id
+  zone                     = var.zone
+  service_account_key_file = var.sa_key_file
+}
+EOF
+
+cat > terraform.tfvars.example <<'EOF'
+# Пример значений переменных практики 8.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-k8s"
+
+# Кластер Kubernetes: мастер платный круглосуточно и создаётся
+# 10-15 минут. Держите его включённым только на время практики.
+create_cluster = false
+master_type    = "zonal"    # zonal — дешевле, regional — отказоустойчивее
+k8s_version    = ""         # пусто — версия по умолчанию
+
+# Узлы: обычные машины, за них платят как за машины.
+node_count  = 1
+node_cores  = 2
+node_memory = 4
+EOF
+
+МОДУЛЬ СЕТИ ВРУЧНУЮ
+
+Модуль сети создан в практике 3 и используется всеми
+последующими практиками, кроме практики 7: реестру, функции
+и шлюзу API сеть не нужна. Если вы копировали готовые файлы,
+он уже на месте. Если создаёте всё сами — создайте и модуль:
+
+  mkdir -p ../modules/vpc
+
+Содержимое четырёх файлов модуля приведено в практике 3, в разделе
+«МОДУЛЬ СЕТИ ЦЕЛИКОМ», или возьмите готовые:
+
+  cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+Код каждого файла проекта приведён в том разделе, где этот
+файл разбирается.
+
+------------------------------------------------------------------
+1. КЛАСТЕР KUBERNETES: ЧТО НУЖНО, КРОМЕ ЖЕЛАНИЯ
+------------------------------------------------------------------
+
+Кластер не создаётся «сам по себе»: у него два сервисных аккаунта,
+и у каждого своя работа.
+
+  СЕРВИСНЫЙ АККАУНТ КЛАСТЕРА — от его имени мастер создаёт и удаляет
+  ресурсы: диски узлов, адреса, балансировщики. Роли (из документации
+  Managed Service for Kubernetes):
+
+    k8s.clusters.agent               управлять ресурсами кластера
+    vpc.publicAdmin                  выдавать публичные адреса
+    container-registry.images.puller забирать образы из реестра
+
+  СЕРВИСНЫЙ АККАУНТ УЗЛОВ — им пользуются сами узлы: забирают образы,
+  подключают диски к подам.
+
+    container-registry.images.puller
+    compute.editor
+    vpc.user
+
+  Роли выдаются ДО создания кластера, и это надо выразить явно:
+
+    depends_on = [
+      yandex_resourcemanager_folder_iam_member.k8s_cluster_agent,
+      yandex_resourcemanager_folder_iam_member.k8s_vpc_admin,
+      yandex_resourcemanager_folder_iam_member.k8s_nodes_puller,
+    ]
+
+  Без depends_on Terraform попробует создать кластер и права
+  одновременно, и создание упадёт.
+
+  Отдельно бывает роль kms.keys.encrypterDecrypter — если секреты
+  кластера шифруются своим ключом KMS, и logging.writer — если логи
+  мастера отправляются в Cloud Logging.
+
+Файл k8s.tf описывает всё сразу: два сервисных аккаунта с ролями,
+мастер и группу узлов. Ниже он приведён целиком, а в разделах 2 и 3
+разобран по частям.
+
+cat > k8s.tf <<'EOF'
+# Кластер Managed Service for Kubernetes и группа узлов.
+#
+# ЧТО СТОИТ ДЕНЕГ И ВРЕМЕНИ
+#
+#   Мастер кластера платный круглосуточно — независимо от того,
+#   работают ли узлы. Создаётся он 10-15 минут, удаляется тоже
+#   не мгновенно. Поэтому в курсе кластер включают переменной
+#   create_cluster на время разбора.
+#
+#   Узлы — это обычные виртуальные машины: за них платят как за
+#   машины. Мы делаем их прерываемыми, чтобы снизить цену учебного стенда.
+
+# ------------------------------------------------------------------
+# Сервисные аккаунты: их два, и они разные
+# ------------------------------------------------------------------
+
+# Сервисный аккаунт КЛАСТЕРА. От его имени мастер создаёт и удаляет
+# ресурсы: диски узлов, адреса, балансировщики. Роли —
+# из документации Managed Service for Kubernetes:
+#
+#   k8s.clusters.agent      — управлять ресурсами кластера и узлов;
+#   vpc.publicAdmin         — выдавать публичные адреса (нужно, если
+#                             узлы получают внешний адрес);
+#   container-registry.images.puller — забирать образы из реестра.
+resource "yandex_iam_service_account" "k8s_cluster" {
+  count = var.create_cluster ? 1 : 0
+
+  name        = "${var.project_name}-cluster-sa"
+  description = "Сервисный аккаунт кластера Kubernetes"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "k8s_cluster_agent" {
+  count = var.create_cluster ? 1 : 0
+
+  folder_id = var.folder_id
+  role      = "k8s.clusters.agent"
+  member    = "serviceAccount:${yandex_iam_service_account.k8s_cluster[0].id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "k8s_vpc_admin" {
+  count = var.create_cluster ? 1 : 0
+
+  folder_id = var.folder_id
+  role      = "vpc.publicAdmin"
+  member    = "serviceAccount:${yandex_iam_service_account.k8s_cluster[0].id}"
+}
+
+# Сервисный аккаунт УЗЛОВ. Узлы забирают образы из реестра
+# и подключают диски, поэтому роли другие.
+resource "yandex_iam_service_account" "k8s_nodes" {
+  count = var.create_cluster ? 1 : 0
+
+  name        = "${var.project_name}-nodes-sa"
+  description = "Сервисный аккаунт узлов кластера"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "k8s_nodes_puller" {
+  count = var.create_cluster ? 1 : 0
+
+  folder_id = var.folder_id
+  role      = "container-registry.images.puller"
+  member    = "serviceAccount:${yandex_iam_service_account.k8s_nodes[0].id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "k8s_nodes_compute" {
+  count = var.create_cluster ? 1 : 0
+
+  folder_id = var.folder_id
+  role      = "compute.editor"
+  member    = "serviceAccount:${yandex_iam_service_account.k8s_nodes[0].id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "k8s_nodes_vpc" {
+  count = var.create_cluster ? 1 : 0
+
+  folder_id = var.folder_id
+  role      = "vpc.user"
+  member    = "serviceAccount:${yandex_iam_service_account.k8s_nodes[0].id}"
+}
+
+# ------------------------------------------------------------------
+# Кластер
+# ------------------------------------------------------------------
+
+resource "yandex_kubernetes_cluster" "this" {
+  count = var.create_cluster ? 1 : 0
+
+  name        = "${var.project_name}-cluster"
+  description = "Учебный кластер Kubernetes курса Terraform"
+
+  network_id = module.vpc.network_id
+
+  master {
+    # ЗОНАЛЬНЫЙ мастер — один экземпляр в одной зоне: дешевле,
+    # но при отказе зоны кластер недоступен.
+    #
+    # Зона и подсеть берутся из local в network.tf: подсеть ищется
+    # по зоне, а не по имени. Подробно об этом — в разделе
+    # «ГДЕ РАЗМЕЩАТЬ МАСТЕР И УЗЛЫ» файла network.tf.
+    dynamic "zonal" {
+      for_each = var.master_type == "zonal" ? [1] : []
+
+      content {
+        zone      = local.k8s_zone
+        subnet_id = local.k8s_subnet_id
+      }
+    }
+
+    # РЕГИОНАЛЬНЫЙ мастер — три экземпляра в трёх зонах: дороже,
+    # зато отказ одной зоны кластер переживает. Требует подсеть
+    # в каждой из трёх зон.
+    dynamic "regional" {
+      for_each = var.master_type == "regional" ? [1] : []
+
+      content {
+        region = "ru-central1"
+
+        location {
+          zone      = "ru-central1-a"
+          subnet_id = lookup(local.subnets_by_zone, "ru-central1-a", null)
+        }
+
+        location {
+          zone      = "ru-central1-b"
+          subnet_id = lookup(local.subnets_by_zone, "ru-central1-b", null)
+        }
+
+        location {
+          zone      = "ru-central1-d"
+          subnet_id = lookup(local.subnets_by_zone, "ru-central1-d", null)
+        }
+      }
+    }
+
+    # Публичный адрес API-сервера: без него kubectl с рабочей машины
+    # не подключится. В рабочей среде доступ к API чаще закрывают:
+    # оставляют только внутренний адрес и ходят через бастион
+    # или VPN.
+    public_ip = true
+
+    version = var.k8s_version != "" ? var.k8s_version : null
+
+    maintenance_policy {
+      auto_upgrade = true
+
+      maintenance_window {
+        day        = "monday"
+        start_time = "03:00"
+        duration   = "3h"
+      }
+    }
+
+    security_group_ids = [yandex_vpc_security_group.k8s.id]
+  }
+
+  service_account_id      = yandex_iam_service_account.k8s_cluster[0].id
+  node_service_account_id = yandex_iam_service_account.k8s_nodes[0].id
+
+  # Канал обновлений: STABLE — проверенные версии, RAPID — новые.
+  # Для учебного стенда STABLE предсказуемее.
+  release_channel = "STABLE"
+
+  labels = {
+    course = "terraform"
+    lesson = "8"
+  }
+
+  # Права выдаются до создания кластера, иначе он не сможет создать
+  # свои ресурсы. Явная зависимость надёжнее, чем «обычно успевает».
+  depends_on = [
+    yandex_resourcemanager_folder_iam_member.k8s_cluster_agent,
+    yandex_resourcemanager_folder_iam_member.k8s_vpc_admin,
+    yandex_resourcemanager_folder_iam_member.k8s_nodes_puller,
+  ]
+
+  # Проверки до обращения к облаку.
+  #
+  # Без них ошибка выглядела бы так:
+  #
+  #   Error: Invalid index
+  #   The given key does not identify an element in this collection value
+  #
+  # — и по ней непонятно ни что случилось, ни что делать. Проверки
+  # выполняются на этапе plan, до создания платных ресурсов.
+  lifecycle {
+    precondition {
+      condition     = local.k8s_subnet_id != null
+      error_message = "В зоне ${var.zone} нет подсети, поэтому мастеру и узлам негде разместиться. Добавьте подсеть этой зоны в network.tf или выберите зону: сейчас подсети есть в зонах ${join(", ", sort(keys(local.subnets_by_zone)))}."
+    }
+
+    precondition {
+      condition = var.master_type != "regional" || alltrue([
+        for zone in ["ru-central1-a", "ru-central1-b", "ru-central1-d"] :
+        contains(keys(local.subnets_by_zone), zone)
+      ])
+      error_message = "Для регионального мастера нужна подсеть в каждой из трёх зон. Сейчас подсети есть в зонах ${join(", ", sort(keys(local.subnets_by_zone)))}."
+    }
+  }
+}
+
+# ------------------------------------------------------------------
+# Группа узлов
+# ------------------------------------------------------------------
+
+resource "yandex_kubernetes_node_group" "workers" {
+  count = var.create_cluster ? 1 : 0
+
+  cluster_id = yandex_kubernetes_cluster.this[0].id
+  name       = "${var.project_name}-workers"
+
+  # Версия узлов не может быть новее версии мастера. Пустая строка
+  # означает «как у мастера».
+  version = var.k8s_version != "" ? var.k8s_version : null
+
+  instance_template {
+    platform_id = "standard-v3"
+
+    resources {
+      cores         = var.node_cores
+      memory        = var.node_memory
+      core_fraction = 20
+    }
+
+    scheduling_policy {
+      preemptible = true
+    }
+
+    boot_disk {
+      type = "network-hdd"
+
+      # МИНИМАЛЬНЫЙ РАЗМЕР ДИСКА УЗЛА — 30 ГБ, и это не рекомендация,
+      # а жёсткое требование облака. С диском 20 ГБ группа узлов
+      # уходит в бесконечное создание машин, а в списке инстансов
+      # видно причину:
+      #
+      #   STATUS: CREATING_INSTANCE [27m]
+      #   [INVALID_ARGUMENT] Request validation error:
+      #   Disk size must be greater or equal than 30.0 GB
+      #
+      # Мы получили эту ошибку на живом стенде. Обратите внимание:
+      # Terraform при этом не падает — группа узлов просто не
+      # становится готовой, а apply ждёт. Смотреть надо в состояние
+      # группы машин, а не в вывод Terraform.
+      size = 30
+    }
+
+    network_interface {
+      # Узлы размещаются без публичных адресов, но с доступом
+      # в интернет для загрузки образов: помогает NAT-шлюз (модуль
+      # создаёт его при create_nat_gateway = true).
+      nat                = false
+      subnet_ids         = [local.k8s_subnet_id]
+      security_group_ids = [yandex_vpc_security_group.k8s.id]
+    }
+
+    container_runtime {
+      type = "containerd"
+    }
+
+    metadata = {
+      ssh-keys = "ubuntu:${file(var.ssh_public_key)}"
+    }
+
+    labels = {
+      course = "terraform"
+      lesson = "8"
+    }
+  }
+
+  scale_policy {
+    fixed_scale {
+      size = var.node_count
+    }
+  }
+
+  # Узлы размещаются в той же зоне, что и мастер: у зонального
+  # кластера это требование, а не рекомендация.
+  allocation_policy {
+    location {
+      zone = local.k8s_zone
+    }
+  }
+
+  deploy_policy {
+    max_expansion   = 1
+    max_unavailable = 0
+  }
+
+  maintenance_policy {
+    auto_upgrade = true
+    auto_repair  = true
+  }
+}
+EOF
+
+------------------------------------------------------------------
+2. ЗОНАЛЬНЫЙ И РЕГИОНАЛЬНЫЙ МАСТЕР
+------------------------------------------------------------------
+
+Мастер — управляющая часть кластера (API-сервер, планировщик,
+контроллеры). Он бывает двух видов.
+
+  ЗОНАЛЬНЫЙ — один экземпляр в одной зоне:
+
+    master {
+      zonal {
+        zone      = var.zone
+        subnet_id = module.vpc.subnet_ids["k8s-d"]
+      }
+    }
+
+  Дешевле, но при отказе зоны кластер недоступен (поды продолжат
+  работать, а управлять ими будет нельзя).
+
+  РЕГИОНАЛЬНЫЙ — три экземпляра в трёх зонах:
+
+    master {
+      regional {
+        region = "ru-central1"
+
+        location {
+          zone      = "ru-central1-a"
+          subnet_id = module.vpc.subnet_ids["k8s-a"]
+        }
+
+        location {
+          zone      = "ru-central1-b"
+          subnet_id = module.vpc.subnet_ids["k8s-b"]
+        }
+
+        location {
+          zone      = "ru-central1-d"
+          subnet_id = module.vpc.subnet_ids["k8s-d"]
+        }
+      }
+    }
+
+  Отказоустойчивый, но дороже в три раза. И требует подсеть
+  в каждой из трёх зон — если подсети нет, кластер не создастся.
+
+  В конфигурации выбор сделан переменной, а блоки собраны
+  динамическими: так одна конфигурация поддерживает оба режима.
+
+ПУБЛИЧНЫЙ АДРЕС API
+
+    public_ip = true
+
+  Без него kubectl с рабочей машины не подключится. В рабочей среде
+  доступ к API чаще закрывают: оставляют внутренний адрес и ходят
+  через бастион или VPN.
+
+ОКНО ОБСЛУЖИВАНИЯ И КАНАЛ ОБНОВЛЕНИЙ
+
+    maintenance_policy {
+      auto_upgrade = true
+
+      maintenance_window {
+        day        = "monday"
+        start_time = "03:00"
+        duration   = "3h"
+      }
+    }
+
+    release_channel = "STABLE"
+
+  auto_upgrade разрешает облаку обновлять минорные версии
+  в указанное окно. Без окна обновление может прийти в момент
+  нагрузки — а минорное обновление Kubernetes перезапускает
+  компоненты.
+
+  release_channel: STABLE — проверенные версии, RAPID — новые.
+  Для учебного стенда предсказуемее STABLE.
+
+ПОЧЕМУ ПОДСЕТЬ ВЫБИРАЕТСЯ ПО ЗОНЕ, А НЕ ПО ИМЕНИ
+
+  Первая версия этой конфигурации брала подсеть по имени из модуля:
+
+    subnet_id = module.vpc.subnet_ids["k8s-d"]
+
+  На живом стенде это сломалось сразу в нескольких проектах,
+  потому что имя жёстко связано с зоной, а зона у всех разная.
+  Ошибка выглядит так:
+
+    Error: Error while creating Kubernetes cluster: subnet ...
+    does not correspond to the master zone
+
+  либо, если такого ключа в вашем модуле нет:
+
+    Error: Invalid index
+    The given key does not identify an element in this collection value
+
+  Причина в том, что подсеть обязана быть в ТОЙ ЖЕ зоне, где
+  запрошен мастер. Поэтому в network.tf подсеть ищется по зоне:
+
+    locals {
+      subnets_by_zone = {
+        for key, zone in module.vpc.subnet_zones :
+        zone => module.vpc.subnet_ids[key]
+      }
+
+      k8s_zone      = var.zone
+      k8s_subnet_id = lookup(local.subnets_by_zone, var.zone, null)
+    }
+
+  Модуль отдаёт карту «ключ подсети → зона» (subnet_zones),
+  мы строим обратную — «зона → подсеть» — и берём нужную зону.
+  Как бы ни назывались подсети в вашем модуле, конфигурация
+  найдёт подсеть по зоне.
+
+  Если подсети в этой зоне нет, terraform plan остановится
+  с понятным текстом, а не с загадочным «Invalid index»:
+
+    Error: Module output ... precondition failed
+    В зоне ru-central1-a нет подсети, поэтому мастеру и узлам
+    негде разместиться. Добавьте подсеть этой зоны в network.tf
+    или выберите зону: сейчас подсети есть в зонах
+    ru-central1-a, ru-central1-b, ru-central1-d.
+
+  Такие проверки (lifecycle → precondition) полезны не только
+  в учебном проекте: они превращают непонятную ошибку облака
+  в инструкцию, что делать. Проверка выполняется на этапе plan,
+  то есть до создания платных ресурсов.
+
+Файл network.tf собирает всё, о чём говорилось выше: модуль сети
+с тремя подсетями, locals с картой subnets_by_zone и группу
+безопасности для мастера и узлов. Ниже он приведён целиком.
+
+cat > network.tf <<'EOF'
+# Сеть для кластера Kubernetes.
+#
+# Подсети создаются в трёх зонах: у зонального мастера нужна одна
+# подсеть (в его зоне), у регионального — по одной в каждой зоне.
+# Мы создаём три всегда: так одна и та же сеть годится для обоих
+# типов мастера, и переключение типа не требует пересборки сети.
+
+module "vpc" {
+  source = "../modules/vpc"
+
+  network_name = "${var.project_name}-net"
+
+  subnets = {
+    k8s-a = {
+      zone = "ru-central1-a"
+      cidr = "10.90.10.0/24"
+    }
+    k8s-b = {
+      zone = "ru-central1-b"
+      cidr = "10.90.20.0/24"
+    }
+    k8s-d = {
+      zone = "ru-central1-d"
+      cidr = "10.90.30.0/24"
+    }
+  }
+
+  # Узлам нужен доступ к реестру образов, к API Kubernetes и для
+  # установки пакетов, поэтому исходящий трафик открыт (в модуле
+  # правило egress разрешает всё). Входящий трафик наружу открывать
+  # не нужно: к кластеру обращаются через API.
+  allowed_ports = []
+
+  # Узлы создаются БЕЗ публичных адресов (nat = false в шаблоне
+  # группы узлов), поэтому им нужен NAT-шлюз — иначе они не смогут
+  # скачать образы, и поды останутся в состоянии ImagePullBackOff.
+  # Подробно эта ловушка разобрана в практике 4.
+  create_nat_gateway = true
+
+  labels = {
+    course = "terraform"
+    lesson = "8"
+  }
+}
+
+# ------------------------------------------------------------------
+# ГДЕ РАЗМЕЩАТЬ МАСТЕР И УЗЛЫ
+# ------------------------------------------------------------------
+#
+# Главное правило: подсеть обязана быть в ТОЙ ЖЕ зоне, что указана
+# в переменной zone. Мастер и узлы живут в одной подсети, и зона
+# у них общая.
+#
+# Раньше подсеть брали по жёстко вписанному имени из модуля:
+#
+#   subnet_id = module.vpc.subnet_ids["k8s-d"]      # так делать не надо
+#
+# Это ломается в двух случаях, и оба встречаются на практике:
+#
+#   * в terraform.tfvars указана другая зона (например,
+#     ru-central1-a) — мастер запрашивается в одной зоне, а подсеть
+#     ему передают из другой. Облако отвечает отказом: подсеть
+#     не найдена или не соответствует зоне мастера;
+#   * в модуле сети подсети названы иначе (свои ключи из практики 3),
+#     и ключа «k8s-d» просто нет — Terraform падает на плане
+#     с сообщением про отсутствующий элемент карты.
+#
+# Поэтому подсеть ищем ПО ЗОНЕ. Модуль отдаёт карту «ключ подсети →
+# зона» (subnet_zones), из неё строим обратную: «зона → подсеть».
+#
+# Если в одной зоне окажется несколько подсетей, в карте останется
+# последняя по порядку ключей: для учебного проекта этого достаточно,
+# а в рабочем лучше держать по одной подсети на зону.
+locals {
+  subnets_by_zone = {
+    for key, zone in module.vpc.subnet_zones :
+    zone => module.vpc.subnet_ids[key]
+  }
+
+  # Зона и подсеть для мастера и узлов.
+  #
+  # lookup с третьим аргументом обязателен: если зоны в карте нет,
+  # значение станет null, и сработает проверка в ресурсе кластера
+  # (см. k8s.tf) — с понятным текстом вместо «Invalid index».
+  k8s_zone      = var.zone
+  k8s_subnet_id = lookup(local.subnets_by_zone, var.zone, null)
+}
+
+# Отдельная группа безопасности для кластера и узлов.
+#
+# Kubernetes требует более широких правил, чем обычная машина:
+# узлам нужно общаться друг с другом, с мастером и с балансировщиком
+# внутри сети. Поэтому правило «всё внутри своей сети» здесь —
+# не лень, а необходимость.
+resource "yandex_vpc_security_group" "k8s" {
+  name        = "${var.project_name}-k8s-sg"
+  description = "Трафик внутри кластера и узлов"
+  network_id  = module.vpc.network_id
+
+  labels = {
+    course = "terraform"
+    lesson = "8"
+  }
+}
+
+resource "yandex_vpc_security_group_rule" "k8s_internal" {
+  security_group_binding = yandex_vpc_security_group.k8s.id
+  direction              = "ingress"
+  description            = "Трафик внутри кластера"
+
+  protocol       = "ANY"
+  from_port      = 0
+  to_port        = 65535
+  v4_cidr_blocks = ["10.90.0.0/16"]
+}
+
+# Доступ к API-серверу снаружи.
+#
+# Без этого правила kubectl с рабочей машины не подключается —
+# и это выглядит как «кластер не работает»:
+#
+#   Unable to connect to the server: dial tcp 130.193.46.202:443:
+#   connectex: A connection attempt failed because the connected party
+#   did not properly respond after a period of time
+#
+# Мастер доступен по публичному адресу (public_ip = true), но группа
+# безопасности пускала трафик только изнутри сети. Мы получили эту
+# ошибку на живом стенде.
+#
+# В учебной конфигурации открыт весь интернет. В рабочей среде здесь
+# должен быть адрес офиса или VPN:
+#
+#   v4_cidr_blocks = ["203.0.113.10/32"]
+resource "yandex_vpc_security_group_rule" "k8s_api" {
+  security_group_binding = yandex_vpc_security_group.k8s.id
+  direction              = "ingress"
+  description            = "Доступ к API Kubernetes (учебный стенд)"
+
+  protocol       = "TCP"
+  port           = 443
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+resource "yandex_vpc_security_group_rule" "k8s_egress" {
+  security_group_binding = yandex_vpc_security_group.k8s.id
+  direction              = "egress"
+  description            = "Исходящий трафик"
+
+  protocol       = "ANY"
+  from_port      = 0
+  to_port        = 65535
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+EOF
+
+------------------------------------------------------------------
+3. ГРУППА УЗЛОВ
+------------------------------------------------------------------
+
+Узлы — это обычные виртуальные машины, которыми управляет облако.
+
+  resource "yandex_kubernetes_node_group" "workers" {
+    cluster_id = yandex_kubernetes_cluster.this[0].id
+    name       = "${var.project_name}-workers"
+
+    instance_template {
+      platform_id = "standard-v3"
+
+      resources {
+        cores         = var.node_cores
+        memory        = var.node_memory
+        core_fraction = 20
+      }
+
+      scheduling_policy {
+        preemptible = true
+      }
+
+      boot_disk {
+        type = "network-hdd"
+
+        # МИНИМАЛЬНЫЙ РАЗМЕР ДИСКА УЗЛА — 30 ГБ.
+        # С меньшим размером группа узлов уходит в бесконечное
+        # создание машин (мы это проверили: диск 20 ГБ, 27 минут
+        # в статусе CREATING_INSTANCE).
+        size = 30
+      }
+
+      network_interface {
+        nat                = false
+        subnet_ids         = [module.vpc.subnet_ids["k8s-d"]]
+        security_group_ids = [yandex_vpc_security_group.k8s.id]
+      }
+
+      container_runtime {
+        type = "containerd"
+      }
+    }
+
+    scale_policy {
+      fixed_scale {
+        size = var.node_count
+      }
+    }
+  }
+
+ЧТО ЗДЕСЬ ВАЖНО
+
+  УЗЛЫ БЕЗ ПУБЛИЧНЫХ АДРЕСОВ (nat = false) — так правильно, но им
+  нужен выход в интернет, чтобы скачивать образы. Если в сети нет
+  NAT-шлюза, поды останутся в состоянии ImagePullBackOff, а узлы
+  будут выглядеть здоровыми. В нашей конфигурации модуль сети
+  создаёт NAT-шлюз:
+
+    module "vpc" {
+      # ...
+      create_nat_gateway = true
+    }
+
+  ПРЕРЫВАЕМЫЕ УЗЛЫ. Для учебного стенда это экономия, для рабочей нагрузки —
+  риск: прерываемый узел может исчезнуть в любой момент, и поды
+  на нём перезапустятся. В рабочем кластере узлы обычные.
+
+  ГРУППА БЕЗОПАСНОСТИ обязательна. Узлам нужно общаться друг
+  с другом, с мастером и с балансировщиком внутри сети:
+
+    resource "yandex_vpc_security_group_rule" "k8s_internal" {
+      security_group_binding = yandex_vpc_security_group.k8s.id
+      direction              = "ingress"
+      protocol               = "ANY"
+      from_port              = 0
+      to_port                = 65535
+      v4_cidr_blocks         = ["10.90.0.0/16"]
+    }
+
+  Правило «всё внутри своей сети» здесь не лень, а необходимость.
+
+  ВТОРОЕ ПРАВИЛО — ДОСТУП К API СНАРУЖИ
+
+  Его легко забыть, и тогда кластер выглядит неработающим:
+
+    resource "yandex_vpc_security_group_rule" "k8s_api" {
+      security_group_binding = yandex_vpc_security_group.k8s.id
+      direction              = "ingress"
+      description            = "Доступ к API Kubernetes"
+      protocol               = "TCP"
+      port                   = 443
+      v4_cidr_blocks         = ["0.0.0.0/0"]
+    }
+
+  Мастер доступен по публичному адресу (public_ip = true), но без
+  этого правила kubectl с рабочей машины упирается в тайм-аут:
+
+    Unable to connect to the server: dial tcp 130.193.46.202:443:
+    connectex: A connection attempt failed because the connected party
+    did not properly respond after a period of time
+
+  Мы получили эту ошибку на живом стенде и потратили время на поиск
+  причины: кластер был HEALTHY, узлы готовы, а подключаться было
+  нельзя. В рабочей среде вместо 0.0.0.0/0 здесь адрес офиса или VPN.
+
+------------------------------------------------------------------
+4. ПЕРВЫЙ ЗАПУСК И ПОДКЛЮЧЕНИЕ
+------------------------------------------------------------------
+
+Включаем кластер и запускаем создание. Мастер создаётся 10–15 минут:
+это время стоит потратить с пользой, поэтому apply запускаем СРАЗУ
+и не ждём его молча.
+
+  # в terraform.tfvars
+  create_cluster = true
+
+  terraform apply
+
+Пока apply работает, прочитайте разделы 1–3: именно они описывают
+то, что создаётся прямо сейчас, — роли, мастера и группу узлов.
+Раздел 5 показывает, как то же самое делают готовым модулем.
+Когда apply закончится, смотрим выводы:
+
+  terraform output cluster_commands
+  terraform output master_placement
+
+  master_placement подскажет, в какой зоне и подсети оказались
+  мастер и узлы — полезно сверить с тем, что вы указали.
+
+Выводы описаны в файле outputs.tf: по ним видно, создан ли кластер,
+где разместились мастер и узлы и какие команды выполнить для
+подключения. Ниже он приведён целиком.
+
+cat > outputs.tf <<'EOF'
+# Выводы практики 8: что понадобится для подключения к кластеру
+# и что удобно проверить одной командой.
+
+output "cluster_id" {
+  description = "Идентификатор кластера Kubernetes"
+  value       = var.create_cluster ? yandex_kubernetes_cluster.this[0].id : null
+}
+
+output "cluster_external_endpoint" {
+  description = "Адрес API-сервера кластера"
+  value       = var.create_cluster ? yandex_kubernetes_cluster.this[0].master[0].external_v4_endpoint : null
+}
+
+output "master_placement" {
+  description = "Зона и подсеть, где размещены мастер и узлы"
+  value       = var.create_cluster ? "${local.k8s_zone} → ${local.k8s_subnet_id}" : null
+}
+
+output "cluster_commands" {
+  description = "Как подключиться к кластеру и посмотреть узлы"
+  value = var.create_cluster ? {
+    kubeconfig = "yc managed-kubernetes cluster get-credentials ${yandex_kubernetes_cluster.this[0].name} --external --force"
+    nodes      = "kubectl get nodes -o wide"
+    pods       = "kubectl get pods -A"
+  } : null
+}
+
+output "node_group_size" {
+  description = "Сколько узлов в группе"
+  value       = var.create_cluster ? var.node_count : 0
+}
+EOF
+
+ПОДКЛЮЧЕНИЕ К КЛАСТЕРУ
+
+  yc managed-kubernetes cluster get-credentials <имя> --external --force
+  kubectl get nodes -o wide
+  kubectl get pods -A
+
+  Ключ --external означает «настроить kubectl на публичный адрес
+  API». Ключ --force перезапишет существующий контекст, если он есть.
+
+  ЧТО ПОЛУЧИЛОСЬ НА НАШЕМ СТЕНДЕ
+
+    kubectl get nodes -o wide
+    NAME                       STATUS  AGE    VERSION   INTERNAL-IP
+    cl1bmll9kk8p1ffprtde-ihef  Ready   4m44s  v1.35.1   10.90.30.28
+
+    kubectl get pods -A
+    kube-system  coredns-...             1/1  Running
+    kube-system  kube-proxy-...          1/1  Running
+    kube-system  metrics-server-...      1/1  Running
+    kube-system  yc-disk-csi-node-v2-... 6/6  Running
+
+  Три вывода из этого вывода:
+
+    * версия Kubernetes — 1.35, её выбрал канал STABLE; версию узлов
+      облако подбирает под мастера;
+    * операционная система узлов — Ubuntu 22.04, а не та, что
+      в семействе образов для обычных машин: управляемые узлы
+      собирает облако, и влиять на их ОС нельзя;
+    * образы тянутся через NAT-шлюз. Проверить это можно так:
+
+        kubectl create deployment hello --image=nginx:alpine
+        kubectl get pods
+        NAME                     READY   STATUS    RESTARTS   AGE
+        hello-7bd557966d-mn5gk   1/1     Running   0          46s
+
+      Если бы NAT-шлюза не было, под висел бы в ImagePullBackOff.
+
+
+------------------------------------------------------------------
+5. КАК ЭТО ЖЕ ДЕЛАЮТ ГОТОВЫМ МОДУЛЕМ
+------------------------------------------------------------------
+
+Создавать кластер вручную — 80 строк конфигурации. Готовый модуль
+terraform-yc-kubernetes делает то же самое и вдобавок умеет больше:
+
+  module "kube" {
+    # Адрес без суффикса .git — тоже рабочий вариант (проверено).
+    source = "git::https://github.com/terraform-yc-modules/terraform-yc-kubernetes?ref=1.1.3"
+
+    network_id = module.vpc.network_id
+
+    master_locations = [
+      for s in module.vpc.private_subnets : {
+        zone      = s.zone
+        subnet_id = s.subnet_id
+      }
+    ]
+
+    master_maintenance_windows = [{
+      day        = "monday"
+      start_time = "23:00"
+      duration   = "3h"
+    }]
+
+    node_groups = {
+      "yc-k8s-ng-01" = {
+        description = "Основная группа узлов"
+        fixed_scale = { size = 3 }
+        node_labels = { role = "worker-01", environment = "testing" }
+      }
+      "yc-k8s-ng-02" = {
+        description = "Группа с автомасштабированием"
+        auto_scale  = { min = 2, max = 4, initial = 2 }
+        node_labels = { role = "worker-02", environment = "dev" }
+        max_expansion   = 1
+        max_unavailable = 1
+      }
+    }
+  }
+
+ЧТО ЗДЕСЬ СТОИТ ОТМЕТИТЬ
+
+  * источник — git::https с тегом; адрес из документации
+    (git@github.com:...) требует SSH-ключа и без него не работает
+    (подробно в практике 3);
+  * модуль принимает СПИСКИ групп узлов словарём, и это удобнее
+    ручного описания: двадцать строк вместо сотни;
+  * входные переменные модуля надо смотреть в его README: они шире,
+    чем у нашего учебного примера.
+
+  ИСПРАВЛЕНО. В прежней версии курса модули подключались по адресу
+  git@github.com:... без указания версии. Это дважды плохо: нужен
+  SSH-ключ в GitHub и нет фиксации версии — модуль может измениться
+  в любой момент.
+
+------------------------------------------------------------------
+6. ЧТО СТОИТ И ЧЕГО НЕ СТОИТ ДЕЛАТЬ В KUBERNETES ЧЕРЕЗ TERRAFORM
+------------------------------------------------------------------
+
+Частый вопрос: «нужно ли описывать в Terraform всё, что внутри
+кластера?»
+
+Ответ: нет, и вот почему.
+
+  В TERRAFORM ОПИСЫВАЮТ:
+    * сам кластер и группы узлов;
+    * сеть, подсети, группы безопасности;
+    * реестр образов и права доступа к нему;
+    * сервисные аккаунты и роли;
+    * балансировщики, если они живут вне кластера.
+
+  ВНУТРИ КЛАСТЕРА ОБЫЧНО ОПИСЫВАЮТ ДРУГИМИ ИНСТРУМЕНТАМИ:
+    * Helm-чартами — приложения;
+    * манифестами и kustomize — объекты Kubernetes;
+    * Argo CD или Flux — то, что разворачивается непрерывно.
+
+  Причина простая: изменения внутри кластера происходят десятки раз
+  в день (новые версии образов, правки конфигураций), а изменения
+  инфраструктуры — раз в недели. Один конвейер для этих двух
+  скоростей неудобен: план Terraform будет каждый день показывать
+  одно и то же.
+
+  Практическое правило: Terraform создаёт кластер, а что внутри
+  кластера — дело инструментов, которые для этого предназначены.
+  Кстати, есть провайдер Kubernetes для Terraform, и им пользуются,
+  когда объектов мало и они меняются редко.
+
+------------------------------------------------------------------
+7. СКОЛЬКО ЭТО СТОИТ
+------------------------------------------------------------------
+
+Kubernetes — самая дорогая часть курса, и считать деньги здесь
+надо ДО создания ресурсов, а не после счёта.
+
+  МАСТЕР КЛАСТЕРА — платный круглосуточно. Зональный дешевле
+  регионального примерно в три раза. Именно мастер, а не узлы,
+  делает кластер дорогим «на всякий случай»: забытый на месяц
+  учебный кластер стоит как несколько рабочих машин.
+
+  УЗЛЫ — платят как за виртуальные машины. Прерываемые дешевле,
+  core_fraction = 20 дешевле, чем 100.
+
+  БАЛАНСИРОВЩИКИ внутри кластера создаются автоматически при
+  использовании сервисов типа LoadBalancer — это тоже расход.
+
+  РЕЕСТР ОБРАЗОВ — за хранение (практика 7).
+
+Отсюда две привычки:
+
+  1. Не держать кластер включённым дольше нужного.
+  2. Использовать прерываемые узлы и минимальные пресеты.
+
+Проверить, что кластер удалён, можно двумя способами:
+
+  yc managed-kubernetes cluster list
+  terraform state list
+
+
+------------------------------------------------------------------
+8. УБОРКА
+------------------------------------------------------------------
+
+Мастер платный круглосуточно, поэтому уборка здесь — часть
+работы, а не вежливость в конце. Есть два способа.
+
+СПОСОБ 1 — ВЫКЛЮЧИТЬ КЛАСТЕР ПЕРЕМЕННОЙ (быстрее)
+
+  # в terraform.tfvars
+  create_cluster = false
+
+  terraform apply
+
+  Кластер, группа узлов и их сервисные аккаунты удалятся, а сеть,
+  подсети и NAT-шлюз останутся: они бесплатны, и в следующий раз
+  apply пройдёт быстрее. Именно так удобно работать,
+  если нужно несколько раз включать и выключать кластер.
+
+СПОСОБ 2 — УДАЛИТЬ ВСЁ
+
+  terraform destroy
+
+  Удаление мастера занимает несколько минут: если прервать его
+  на середине, кластер останется в состоянии DELETING, и за это
+  время деньги продолжают списываться.
+
+ПРОВЕРКА, ЧТО НИЧЕГО НЕ ОСТАЛОСЬ
+
+  yc managed-kubernetes cluster list
+  yc managed-kubernetes node-group list
+  yc vpc subnet list --folder-id <folder_id>
+
+  Удаление выполняется от имени сервисного аккаунта кластера:
+  если у него не хватает прав на удаление подсети или адреса,
+  destroy остановится с ошибкой про права — это ещё одна причина
+  выдавать роли заранее, как в разделе 1.
+
+
+------------------------------------------------------------------
+9. РАЗБОР ПОЛОМОК
+------------------------------------------------------------------
+
+Все ошибки ниже получены на живом стенде.
+
+  СИМПТОМ: кластер не создаётся, в тексте ошибки — подсеть
+  ПРИЧИНА: подсеть мастера не существует или находится в другой
+  зоне. Так бывает, когда зона в terraform.tfvars не совпадает
+  с зоной подсети: подсеть берут по имени из модуля (например,
+  «k8s-d»), а зону указывают другую.
+  ЧТО ДЕЛАТЬ: в этой конфигурации подсеть ищется по зоне
+  в network.tf (local.subnets_by_zone), а precondition в k8s.tf
+  останавливает plan с подсказкой, каких зон не хватает. Если вы
+  правили конфигурацию руками — проверьте, что зона подсети,
+  зона мастера (master.zonal.zone) и зона в allocation_policy
+  группы узлов совпадают.
+
+
+  СИМПТОМ: кластер не создаётся, ошибка про права сервисного аккаунта
+  ПРИЧИНА: у сервисного аккаунта кластера нет ролей k8s.clusters.agent
+  и vpc.publicAdmin, либо роли выданы одновременно с созданием
+  кластера.
+  ЧТО ДЕЛАТЬ: проверить роли и добавить depends_on на ресурсы выдачи
+  прав.
+
+  СИМПТОМ: узлы создаются, но поды висят в ImagePullBackOff
+  ПРИЧИНА 1: узлам не хватает прав: нужна роль
+  container-registry.images.puller сервисному аккаунту узлов.
+  ПРИЧИНА 2: у узлов нет выхода в интернет (нет NAT-шлюза при
+  nat = false).
+  ЧТО ДЕЛАТЬ: проверить роли и маршрут в интернет — так же, как
+  в практике 4.
+
+  СИМПТОМ: apply «висит» на создании группы узлов, узлы не появляются
+  ПРИЧИНА: размер загрузочного диска узла меньше минимального.
+  В списке инстансов группы машин видно точную причину:
+
+    yc compute instance-group list-instances <instance_group_id>
+    STATUS: CREATING_INSTANCE [27m]
+    [INVALID_ARGUMENT] Request validation error:
+    Disk size must be greater or equal than 30.0 GB
+
+  Terraform при этом не падает — он ждёт готовности группы.
+  ЧТО ДЕЛАТЬ: поставить размер диска 30 ГБ или больше. Мы потеряли
+  на этом больше получаса: сообщение об ошибке видно только
+  в состоянии группы машин, а не в выводе Terraform.
+
+  СИМПТОМ: kubectl не подключается к кластеру
+  ПРИЧИНА 1: не выполнен yc managed-kubernetes cluster
+  get-credentials.
+  ПРИЧИНА 2: у мастера нет публичного адреса (public_ip = false),
+  а вы подключаетесь снаружи.
+  ПРИЧИНА 3: группа безопасности кластера не пускает трафик
+  на порт 443 снаружи. Это самая частая причина: кластер HEALTHY,
+  узлы готовы, а kubectl получает тайм-аут.
+  ЧТО ДЕЛАТЬ: проверить контекст kubectl (kubectl config
+  get-contexts), публичный адрес и правила группы безопасности.
+
+
+------------------------------------------------------------------
+10. ЗАДАНИЯ
+------------------------------------------------------------------
+
+  1. Кластер. Переключите master_type на regional и посмотрите план.
+     Ответьте: чем региональный мастер отличается по стоимости
+     и по требованиям к сети?
+
+  2. Узлы. Добавьте вторую группу узлов с автоматическим
+     масштабированием и метками для планировщика. Убедитесь, что
+     поды можно размещать на конкретной группе.
+
+  3. Приложение. Разверните в кластере любое приложение через
+     Helm и убедитесь, что образ берётся из вашего реестра.
+
+  4. Экономика. Посчитайте, во что обойдётся этот стенд за сутки
+     непрерывной работы, и предложите три способа сократить расходы,
+     не потеряв работоспособность.
+
+
+------------------------------------------------------------------
+11. ЧТО ДАЛЬШЕ
+------------------------------------------------------------------
+
+Инфраструктура собрана: сеть, машины, данные, Kubernetes
+и serverless. В практике 9 займёмся тем, без чего это всё не живёт
+в рабочей среде: разделением окружений, конвейером с планом
+в pull request, тестами конфигурации и итоговым стендом, который
+разворачивается одной командой.

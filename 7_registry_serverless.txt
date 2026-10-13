@@ -1,0 +1,1082 @@
+ПРАКТИКА 7. РЕЕСТР ОБРАЗОВ И SERVERLESS
+
+Продолжительность: 1 академический час.
+Провайдер: yandex-cloud/yandex. Практика выполняется в Яндекс Облаке.
+
+ЧТО БУДЕТ К КОНЦУ ПРАКТИКИ
+
+  Вы создадите реестр образов с политикой очистки, а рядом —
+  serverless-сервис: функцию и шлюз API перед ней. По дороге
+  разберётесь, как Terraform работает с кодом, который лежит не
+  в файлах конфигурации, а в Object Storage, и почему роль
+  сервисного аккаунта иногда называется совсем не так, как
+  подсказывает логика.
+
+ЧТО НУЖНО ЗАРАНЕЕ
+
+  * Практики 1–6: доступ, состояние, модули, машины, сети, данные.
+  * Роль storage.editor у сервисного аккаунта: код функции
+    загружается в Object Storage (как выдать роль — практика 1).
+  * Docker — только для упражнения в конце практики.
+
+ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ПРАКТИКА
+
+  Реестр образов, кластер Kubernetes и serverless-функция — темы
+  родственные, но в курсе они разделены на две практики. Причина
+  в цене времени и денег: мастер кластера Kubernetes создаётся
+  10–15 минут и стоит круглосуточно, поэтому вся практика 8
+  построена вокруг ожидания кластера и разбора его ошибок.
+
+  Если добавить к этому реестр и функцию, до них просто не дойдёт
+  очередь: они делаются за минуту и стоят копейки, а ждать
+  и платить приходится из-за чужого ресурса.
+
+  Отсюда разделение:
+
+    практика 7 (эта) — реестр и serverless: создаётся за минуту,
+                       стоит копейки, можно не удалять;
+    практика 8       — кластер Kubernetes: самая дорогая и самая
+                       медленная часть курса, создаётся и удаляется
+                       подряд, в одном проходе.
+
+  Порядок именно такой: реестр и функция не зависят от кластера,
+  зато кластеру нужен реестр — из него он забирает образы.
+  Поэтому практика 7 проходится первой и без спешки.
+
+ЭТА ПРАКТИКА ПОЧТИ БЕСПЛАТНА
+
+  Реестр берёт деньги за хранение образов: пока вы ничего не
+  загрузили, платить не за что. Функция и шлюз API стоят копейки —
+  платят за вызовы и время работы. Эти ресурсы можно оставить
+  включёнными до конца курса.
+
+
+------------------------------------------------------------------
+0. КАТАЛОГ ПРОЕКТА И ФАЙЛЫ
+------------------------------------------------------------------
+
+Правило, которое нарушают чаще всего: ОДИН ПРОЕКТ — ОДИН
+КАТАЛОГ. Terraform работает с состоянием в пределах каталога,
+поэтому файлы разных проектов в одной папке перемешают ресурсы
+и состояние.
+
+Создаём каталог практики:
+
+  mkdir -p ~/terraform-course/work/07-registry
+  cd ~/terraform-course/work/07-registry
+
+Здесь ~/terraform-course — клон репозитория с материалами курса.
+Каталог work/ внутрь репозитория не попадает: он перечислен
+в .gitignore, чтобы ваши эксперименты не смешивались
+с материалами курса.
+
+СТРУКТУРА ПРОЕКТА
+
+  07-registry/
+  ├── function/
+  │   ├── build.sh
+  │   ├── function.zip
+  │   └── index.py
+  ├── outputs.tf
+  ├── provider.tf
+  ├── registry.tf
+  ├── serverless.tf
+  ├── terraform.tfvars.example
+  ├── variables.tf
+  └── versions.tf
+
+  Плюс файлы, которые создаются при работе и в репозиторий
+  не попадают: terraform.tfvars (значения переменных),
+  terraform.tfstate (состояние), .terraform/ (провайдеры).
+  Файл .terraform.lock.hcl, наоборот, нужно сохранить в git:
+  он фиксирует версии провайдеров.
+
+  Сети и модуля сети в этой практике нет: реестр, бакет, функция
+  и шлюз API — ресурсы уровня каталога, сеть им не нужна. Модуль
+  понадобится в практике 8.
+
+КАК СОЗДАЁМ ФАЙЛЫ
+
+  Файлы можно набрать по тексту практики. Конструкция
+  cat > имя-файла <<'EOF' записывает в файл всё, что введено до
+  строки EOF, поэтому такой блок можно скопировать в терминал
+  целиком. Строки cat и EOF стоят в первом столбце: отступ сломал
+  бы завершение ввода.
+
+  Готовые файлы практики лежат в материалах курса — их можно
+  взять вместо набора по тексту:
+
+    cp -r ~/terraform-course/files/07_registry_serverless/. .
+
+Прежде чем описывать ресурсы, перечислим входные данные.
+variables.tf объявляет переменные практики: идентификаторы облака
+и каталога, путь к ключу сервисного аккаунта, ключи доступа
+к Object Storage, префикс имён и параметры функции. Значения
+приходят из terraform.tfvars, а блоки validation не дадут указать
+неподдерживаемую среду выполнения или память вне диапазона.
+
+cat > variables.tf <<'EOF'
+# Переменные практики 7: реестр образов и serverless.
+#
+# Переменные описываются один раз, а значения приходят из
+# terraform.tfvars или из переменных окружения TF_VAR_*.
+# Подробно про переменные — в практике 3.
+
+variable "cloud_id" {
+  type        = string
+  description = "Идентификатор облака"
+}
+
+variable "folder_id" {
+  type        = string
+  description = "Идентификатор каталога"
+}
+
+variable "zone" {
+  type        = string
+  description = "Зона по умолчанию для ресурсов провайдера"
+  default     = "ru-central1-d"
+}
+
+variable "sa_key_file" {
+  type        = string
+  description = "Путь к авторизованному ключу сервисного аккаунта"
+}
+
+# Ключи доступа к Object Storage.
+#
+# Они нужны потому, что код функции загружается в бакет: провайдер
+# принимает не локальный файл, а ссылку на объект в Object Storage.
+# Такой ключ создаётся командой yc iam access-key create (практика 2).
+variable "storage_access_key" {
+  type        = string
+  description = "Идентификатор статического ключа доступа (key_id)"
+  default     = null
+  sensitive   = true
+}
+
+variable "storage_secret_key" {
+  type        = string
+  description = "Секретная часть статического ключа доступа"
+  default     = null
+  sensitive   = true
+}
+
+variable "project_name" {
+  type        = string
+  description = "Префикс в именах ресурсов"
+  default     = "tf-serverless"
+}
+
+# ------------------------------------------------------------------
+# Serverless
+# ------------------------------------------------------------------
+
+variable "create_serverless" {
+  type        = bool
+  description = "Создавать ли функцию и шлюз API"
+  default     = true
+}
+
+variable "function_runtime" {
+  type        = string
+  description = "Среда выполнения функции"
+  default     = "python312"
+
+  validation {
+    condition = contains(
+      ["python311", "python312", "nodejs18", "nodejs20", "golang121"],
+      var.function_runtime
+    )
+    error_message = "Выберите поддерживаемую среду выполнения функции."
+  }
+}
+
+variable "function_memory" {
+  type        = number
+  description = "Память функции, МБ"
+  default     = 128
+
+  validation {
+    condition     = var.function_memory >= 128 && var.function_memory <= 1024
+    error_message = "Память функции: от 128 до 1024 МБ."
+  }
+}
+EOF
+
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.3"
+
+  required_providers {
+    yandex = {
+      source  = "yandex-cloud/yandex"
+      version = "~> 0.229.0"
+    }
+  }
+}
+EOF
+
+cat > provider.tf <<'EOF'
+provider "yandex" {
+  cloud_id                 = var.cloud_id
+  folder_id                = var.folder_id
+  zone                     = var.zone
+  service_account_key_file = var.sa_key_file
+
+  # Ключи для Object Storage: в этой практике в бакет загружается
+  # архив с кодом функции (см. serverless.tf).
+  storage_access_key = var.storage_access_key
+  storage_secret_key = var.storage_secret_key
+}
+EOF
+
+cat > terraform.tfvars.example <<'EOF'
+# Пример значений переменных практики 7.
+
+cloud_id    = "b1gXXXXXXXXXXXXXXX"
+folder_id   = "b1gYYYYYYYYYYYYYYY"
+zone        = "ru-central1-d"
+sa_key_file = "/home/user/.yc/tf-course-key.json"
+
+# Ключи доступа к Object Storage: в бакет загружается архив
+# с кодом функции. Ключ создаётся командой:
+#   yc iam access-key create --service-account-id <sa_id> \
+#     --format json > ~/.yc/s3-access-key.json
+storage_access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+storage_secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+
+project_name = "tf-serverless"
+
+# Функция и шлюз API стоят копейки: платят за вызовы и время
+# работы. Их можно держать включёнными между практиками.
+create_serverless = true
+function_runtime  = "python312"
+function_memory   = 128
+EOF
+
+ОСТАЛЬНЫЕ ФАЙЛЫ
+
+  Код каждого файла проекта приведён в том разделе, где этот
+  файл разбирается: variables.tf — выше, registry.tf — в разделе 1,
+  serverless.tf — в разделе 2, function/index.py, function/build.sh
+  и outputs.tf — в разделе 3.
+
+------------------------------------------------------------------
+1. РЕЕСТР ОБРАЗОВ
+------------------------------------------------------------------
+
+Приложению в Kubernetes нужен образ. Место, откуда кластер его
+забирает, — Container Registry.
+
+  resource "yandex_container_registry" "this" {
+    name      = "${var.project_name}-registry"
+    folder_id = var.folder_id
+  }
+
+  resource "yandex_container_repository" "app" {
+    name = "${yandex_container_registry.this.id}/app"
+  }
+
+Имя репозитория указывается в формате «идентификатор реестра /
+имя репозитория» — именно так, потому что реестр может содержать
+много репозиториев, по одному на приложение или на команду.
+
+ПОЛИТИКА ОЧИСТКИ — НЕ РОСКОШЬ, А НЕОБХОДИМОСТЬ
+
+  Хранение образов платное (за гигабайт в сутки). Без политики
+  очистки каждый push добавляет слои, и через год реестр становится
+  заметной статьёй расходов.
+
+  resource "yandex_container_repository_lifecycle_policy" "app" {
+    name          = "${var.project_name}-keep-last"
+    repository_id = yandex_container_repository.app.id
+    status        = "active"
+
+    rule {
+      description  = "Оставлять 5 последних образов с тегами"
+      tag_regexp   = ".*"
+      retained_top = 5
+    }
+
+    rule {
+      description   = "Удалять образы без тегов старше недели"
+      untagged      = true
+      expire_period = "604800s"
+    }
+  }
+
+  Поля правила стоит запомнить, потому что их часто придумывают
+  «по логике» и получают ошибку:
+
+    retained_top   — сколько последних образов оставить;
+    expire_period  — через какой срок удалять ("604800s" — неделя);
+    tag_regexp     — какие теги подпадают под правило;
+    untagged       — удалять ли образы без тегов.
+
+  Отдельного блока для запросов (вроде yql с SQL-выражением) здесь
+  нет — мы это проверили на живом стенде.
+
+КАК ЗАГРУЗИТЬ ОБРАЗ
+
+  yc container registry configure-docker
+
+  docker build -t cr.yandex/<registry_id>/app:v1 .
+  docker push cr.yandex/<registry_id>/app:v1
+
+  Первая команда прописывает в конфигурацию Docker помощник,
+  который подставляет токен облака: пароль вручную не нужен.
+
+Всё, что разобрано выше, лежит в одном файле registry.tf: сам
+реестр, репозиторий приложения и политика очистки с двумя
+правилами. Комментарии в файле объясняют, зачем нужны retained_top
+и expire_period, и почему без политики реестр растёт бесконечно.
+
+cat > registry.tf <<'EOF'
+# Реестр образов Container Registry.
+#
+# Реестр — это место, откуда кластер Kubernetes забирает образы
+# приложений. Реестр живёт в каталоге, внутри него — репозитории
+# (по одному на приложение или на команду).
+#
+# Что стоит денег: хранение образов (за гигабайт в сутки).
+# Поэтому реестру настраивают политику очистки: старые образы
+# удаляются автоматически, иначе реестр растёт бесконечно.
+
+resource "yandex_container_registry" "this" {
+  name      = "${var.project_name}-registry"
+  folder_id = var.folder_id
+
+  labels = {
+    course = "terraform"
+    lesson = "7"
+  }
+}
+
+# Репозиторий внутри реестра. Имя указывается в формате
+# "<идентификатор реестра>/<имя репозитория>".
+resource "yandex_container_repository" "app" {
+  name = "${yandex_container_registry.this.id}/app"
+}
+
+# Политика очистки: держим только свежие образы.
+#
+# Правила читаются как «оставить N последних» и «удалять старше
+# такого-то срока». Без политики каждый push добавляет слои,
+# и через год хранения реестр становится заметной статьёй расходов.
+#
+# Поля правила (это важно — их часто придумывают):
+#   retained_top   — сколько последних образов оставить;
+#   expire_period  — через сколько удалять (например, "604800s" — неделя);
+#   tag_regexp     — какие теги подпадают под правило;
+#   untagged       — удалять ли образы без тегов (их обычно большинство).
+resource "yandex_container_repository_lifecycle_policy" "app" {
+  name          = "${var.project_name}-keep-last"
+  repository_id = yandex_container_repository.app.id
+  status        = "active"
+
+  rule {
+    description  = "Оставлять 5 последних образов с тегами"
+    tag_regexp   = ".*"
+    retained_top = 5
+  }
+
+  rule {
+    description   = "Удалять образы без тегов старше недели"
+    untagged      = true
+    expire_period = "604800s"
+  }
+}
+EOF
+
+------------------------------------------------------------------
+2. ЧТО НУЖНО ДЛЯ SERVERLESS: БАКЕТ, АККАУНТЫ И РОЛИ
+------------------------------------------------------------------
+
+Весь serverless.tf приведён здесь целиком, а дальше разобран
+по частям: так видно и связи между ресурсами, и объяснения.
+В файле пять сущностей — бакет и архив с кодом, два сервисных
+аккаунта, роль на вызов функции, сама функция и шлюз API.
+
+cat > serverless.tf <<'EOF'
+# Serverless: функция и шлюз API.
+#
+# Зачем это в курсе про инфраструктуру: серверные решения описываются
+# тем же Terraform и живут рядом с остальными ресурсами. Функция,
+# шлюз API и база данных могут быть в одной конфигурации — и тогда
+# «инфраструктура» и «приложение» перестают быть разными мирами.
+#
+# Что стоит денег: за саму функцию платят только за вызовы и время
+# работы (миллисекунды). Для учебного стенда это копейки — в отличие
+# от кластера Kubernetes.
+
+# Код функции лежит в Object Storage: провайдер принимает только
+# ссылку на объект-архив, а не локальный файл. Поэтому сначала бакет.
+resource "yandex_storage_bucket" "function_code" {
+  count = var.create_serverless ? 1 : 0
+
+  bucket = "${var.project_name}-functions"
+
+  # Версионирование: если новый архив окажется неудачным,
+  # предыдущий можно вернуть.
+  versioning {
+    enabled = true
+  }
+
+  force_destroy = true
+
+  tags = {
+    course = "terraform"
+    lesson = "7"
+  }
+}
+
+# Архив с кодом.
+#
+# user_hash у функции и source_hash у объекта — это одно и то же
+# по смыслу: хэш содержимого. Без него Terraform не заметит, что код
+# изменился, и функция останется старой (та же ловушка, что со
+# страницей сайта в практике 6).
+resource "yandex_storage_object" "function_code" {
+  count = var.create_serverless ? 1 : 0
+
+  bucket = yandex_storage_bucket.function_code[0].id
+  key    = "function.zip"
+
+  source       = "${path.module}/function/function.zip"
+  source_hash  = filemd5("${path.module}/function/function.zip")
+  content_type = "application/zip"
+}
+
+# Сервисный аккаунт функции: ей нужны права на то, что она делает.
+# Наша функция только отвечает на запросы, но если бы она писала
+# в Object Storage или читала секреты, роли были бы здесь.
+resource "yandex_iam_service_account" "function" {
+  count = var.create_serverless ? 1 : 0
+
+  name        = "${var.project_name}-function-sa"
+  description = "Сервисный аккаунт функции"
+}
+
+# Сервисный аккаунт ШЛЮЗА API — отдельный.
+#
+# Это не формальность: шлюз должен иметь право вызывать функцию.
+# Без выданной роли шлюз отвечает ошибкой, которую легко принять
+# за ошибку в коде функции:
+#
+#   {"message":"request to function '<id>' failed,
+#    reason: Response code 403 (Forbidden)"}
+#
+# Мы получили её на живом стенде именно потому, что роли не было.
+resource "yandex_iam_service_account" "gateway" {
+  count = var.create_serverless ? 1 : 0
+
+  name        = "${var.project_name}-gateway-sa"
+  description = "Сервисный аккаунт шлюза API"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "gateway_invoker" {
+  count = var.create_serverless ? 1 : 0
+
+  folder_id = var.folder_id
+
+  # Имя роли — functions.functionInvoker. Написание functions.invoker
+  # («как логично») облако не принимает:
+  #
+  #   Role 'functions.invoker' not found
+  #
+  # Точные идентификаторы ролей всегда смотрим в документации
+  # сервиса: у них свой стиль именования, и догадаться не получится.
+  role   = "functions.functionInvoker"
+  member = "serviceAccount:${yandex_iam_service_account.gateway[0].id}"
+}
+
+resource "yandex_function" "api" {
+  count = var.create_serverless ? 1 : 0
+
+  name        = "${var.project_name}-function"
+  description = "Учебная функция курса Terraform"
+  user_hash   = filemd5("${path.module}/function/function.zip")
+
+  runtime    = var.function_runtime
+  entrypoint = "index.handler"
+  memory     = var.function_memory
+
+  execution_timeout = "10"
+
+  # Переменные окружения функции: то же, что env в контейнере.
+  environment = {
+    COURSE = "terraform"
+    LESSON = "7"
+  }
+
+  service_account_id = yandex_iam_service_account.function[0].id
+
+  package {
+    bucket_name = yandex_storage_bucket.function_code[0].bucket
+    object_name = yandex_storage_object.function_code[0].key
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "7"
+  }
+}
+
+# Шлюз API: публичный HTTPS-адрес перед функцией.
+#
+# Описание — это спецификация в формате OpenAPI. Минимум, который
+# нужен: путь, метод и ссылка на функцию, которую надо вызвать.
+# Здесь же описывают авторизацию, ограничения по IP и кэширование.
+resource "yandex_api_gateway" "api" {
+  count = var.create_serverless ? 1 : 0
+
+  name        = "${var.project_name}-gateway"
+  description = "Шлюз API перед функцией"
+
+  # От чьего имени шлюз вызывает функцию.
+  #
+  # ВАЖНО: у ресурса yandex_api_gateway НЕТ аргумента
+  # service_account_id — авторизация описывается ВНУТРИ спецификации,
+  # в параметре service_account_id интеграции:
+  #
+  #   Error: Unsupported argument
+  #   An argument named "service_account_id" is not expected here.
+  #
+  # Такую ошибку мы получили на живом стенде, пытаясь вынести
+  # сервисный аккаунт на верхний уровень. Если этого параметра нет
+  # вовсе, шлюз обращается к функции анонимно и получает 403:
+  #
+  #   {"message":"request to function '<id>' failed,
+  #    reason: Response code 403 (Forbidden)"}
+  spec = <<-EOT
+    openapi: 3.0.0
+    info:
+      title: Учебный шлюз API
+      version: 1.0.0
+    paths:
+      /:
+        get:
+          summary: Приветствие от функции
+          x-yc-apigateway-integration:
+            type: cloud_functions
+            function_id: ${yandex_function.api[0].id}
+            tag: $latest
+            service_account_id: ${yandex_iam_service_account.gateway[0].id}
+          responses:
+            '200':
+              description: Успешный ответ функции
+  EOT
+
+  labels = {
+    course = "terraform"
+    lesson = "7"
+  }
+}
+EOF
+
+КОД ФУНКЦИИ ЛЕЖИТ В БАКЕТЕ
+
+  Провайдер принимает не локальный файл, а ссылку на объект
+  в Object Storage. Поэтому первый ресурс — бакет:
+
+    resource "yandex_storage_bucket" "function_code" {
+      bucket = "${var.project_name}-functions"
+
+      versioning {
+        enabled = true
+      }
+
+      force_destroy = true
+    }
+
+  versioning включён не для красоты: если новый архив окажется
+  неудачным, предыдущий можно вернуть. force_destroy разрешает
+  удалить бакет вместе со всеми версиями объектов — без него
+  terraform destroy остановится на непустом бакете (эта ловушка
+  разобрана в практике 6).
+
+  Затем сам архив:
+
+    resource "yandex_storage_object" "function_code" {
+      bucket = yandex_storage_bucket.function_code[0].id
+      key    = "function.zip"
+
+      source      = "${path.module}/function/function.zip"
+      source_hash = filemd5("${path.module}/function/function.zip")
+    }
+
+  source_hash — хэш содержимого архива. Terraform сравнивает хэши,
+  а не время правки файла: без хэша он не заметит, что код изменился.
+  Та же логика у user_hash функции и content_base64 у страниц сайта
+  (практика 6).
+
+ДВА СЕРВИСНЫХ АККАУНТА — ПОТОМУ ЧТО РАБОТА РАЗНАЯ
+
+  Первый — аккаунт функции: от его имени функция работает.
+  Наша функция только отвечает на запросы, поэтому ролей у неё
+  нет; если бы она писала в Object Storage или читала секреты,
+  роли выдавались бы здесь.
+
+    resource "yandex_iam_service_account" "function" {
+      name = "${var.project_name}-function-sa"
+    }
+
+  Второй — аккаунт ШЛЮЗА API. Шлюз вызывает функцию, значит,
+  ему нужно право на вызов:
+
+    resource "yandex_resourcemanager_folder_iam_member" "gateway_invoker" {
+      role   = "functions.functionInvoker"
+      member = "serviceAccount:${yandex_iam_service_account.gateway[0].id}"
+    }
+
+  Имя роли стоит запомнить: логичное на вид functions.invoker
+  облако не принимает:
+
+    Error: Failed to Update IAM Policy
+    Role 'functions.invoker' not found
+
+  Точные идентификаторы ролей смотрим в документации сервиса:
+  у них свой стиль именования, и догадаться по аналогии нельзя.
+
+  Роль storage.editor сервисному аккаунту, из-под которого
+  работает Terraform, нужна для того, чтобы он мог создавать
+  бакет и загружать в него архив.
+
+
+------------------------------------------------------------------
+3. SERVERLESS: ФУНКЦИЯ И ШЛЮЗ API
+------------------------------------------------------------------
+
+Серверные решения описываются тем же Terraform и живут в одной
+конфигурации с остальной инфраструктурой.
+
+КОД ФУНКЦИИ ЛЕЖИТ В OBJECT STORAGE
+
+  Провайдер принимает не локальный файл, а ссылку на архив в бакете:
+
+    resource "yandex_function" "api" {
+      name       = "${var.project_name}-function"
+      user_hash  = filemd5("${path.module}/function/function.zip")
+      runtime    = "python312"
+      entrypoint = "index.handler"
+      memory     = 128
+
+      package {
+        bucket_name = yandex_storage_bucket.function_code[0].bucket
+        object_name = yandex_storage_object.function_code[0].key
+      }
+    }
+
+  user_hash — это хэш содержимого архива. Та же логика, что
+  с source_hash у объектов и content_base64 у страниц сайта
+  (практика 6): без хэша Terraform не заметит, что код изменился.
+
+ФАЙЛЫ КОДА ФУНКЦИИ
+
+  Сам код функции лежит в каталоге function/ рядом с конфигурацией:
+  index.py — обработчик, build.sh — сборка архива. Оба файла
+  создаются блоком cat ниже, поэтому сначала создайте каталог.
+
+  Здесь важен порядок: Terraform не читает index.py напрямую.
+  Он смотрит на архив function.zip, который собирает build.sh.
+  Поэтому правка кода без пересборки архива ничего не меняет —
+  об этом ниже и в разделе «РАЗБОР ПОЛОМОК».
+
+  mkdir -p function
+
+cat > function/index.py <<'EOF'
+"""Учебная функция для курса Terraform.
+
+Точка входа — index.handler: файл index.py, функция handler.
+Функция возвращает JSON, поэтому её удобно проверять командой curl
+и прямым вызовом через командную строку:
+
+    yc serverless function invoke <function_id>
+"""
+
+import json
+import os
+from datetime import datetime, timezone
+
+
+def handler(event, context):
+    """Обработчик запроса.
+
+    event — то, что пришло от шлюза API или прямого вызова:
+    путь, метод, заголовки, тело.
+
+    ВАЖНО: при прямом вызове через командную строку event приходит
+    пустым (None). Если этого не учесть, функция падает с ошибкой
+    «'NoneType' object has no attribute 'get'» — мы получили её
+    на живом стенде. Поэтому первым делом приводим событие к словарю.
+
+    context — служебная информация: идентификатор запроса,
+    оставшееся время работы и так далее.
+    """
+    event = event or {}
+
+    # Заголовки запроса приходят в разном регистре, поэтому приводим
+    # их к нижнему — иначе поиск нужного заголовка становится лотереей.
+    raw_headers = event.get("headers") or {}
+    headers = {str(k).lower(): v for k, v in raw_headers.items()}
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json; charset=utf-8"},
+        "isBase64Encoded": False,
+        "body": json.dumps(
+            {
+                "message": "Функция создана Terraform",
+                "course": os.environ.get("COURSE", "неизвестно"),
+                "lesson": os.environ.get("LESSON", "неизвестно"),
+                "request_id": getattr(context, "request_id", "нет"),
+                "time": datetime.now(timezone.utc).isoformat(),
+                "user_agent": headers.get("user-agent", "не передан"),
+                "event_keys": sorted(event.keys()),
+            },
+            ensure_ascii=False,
+        ),
+    }
+EOF
+
+  Скрипт сборки архива — рядом с кодом. Он собирает function.zip
+  из index.py, а если утилиты zip в системе нет, делает то же
+  средствами Python. В конце скрипт печатает md5 архива: это тот
+  самый хэш, который Terraform видит в user_hash и source_hash.
+
+cat > function/build.sh <<'EOF'
+#!/bin/bash
+# Сборка архива с кодом функции.
+#
+# Зачем скрипт: провайдер Яндекс Облака принимает код функции
+# не файлом с диска, а ссылкой на архив в Object Storage. Поэтому
+# перед terraform apply архив нужно собрать.
+#
+# Запуск из каталога function/:
+#
+#   ./build.sh
+#
+# После правки index.py архив надо пересобрать: сам по себе he
+# обновится, а Terraform сравнит хэш архива (user_hash и source_hash)
+# и не увидит изменений.
+
+set -euo pipefail
+
+SOURCE="index.py"
+ARCHIVE="function.zip"
+
+if [ ! -f "$SOURCE" ]; then
+  echo "Нет файла $SOURCE — запустите скрипт из каталога function/" >&2
+  exit 1
+fi
+
+rm -f "$ARCHIVE"
+
+if command -v zip >/dev/null 2>&1; then
+  zip -q "$ARCHIVE" "$SOURCE"
+else
+  # Если утилиты zip нет — подойдёт Python (он есть на учебной машине).
+  python3 -c "
+import zipfile
+with zipfile.ZipFile('$ARCHIVE', 'w', zipfile.ZIP_DEFLATED) as z:
+    z.write('$SOURCE')
+"
+fi
+
+echo "Собран архив $ARCHIVE:"
+ls -l "$ARCHIVE"
+echo
+echo "Хэш архива (его видит Terraform в source_hash и user_hash):"
+if command -v md5sum >/dev/null 2>&1; then
+  md5sum "$ARCHIVE"
+else
+  python3 -c "
+import hashlib
+print(hashlib.md5(open('$ARCHIVE','rb').read()).hexdigest(), '$ARCHIVE')
+"
+fi
+EOF
+
+  После создания файлов проверьте, что в каталоге function/ есть
+  index.py и build.sh, а function.zip соберётся при первом запуске.
+
+  Архив собирается ОТДЕЛЬНО, до apply. Готовый архив уже лежит
+  в материалах курса (files/07_registry_serverless/function/function.zip),
+  а пересобрать его после правки кода можно скриптом:
+
+    cd ~/terraform-course/work/07-registry/function
+    ./build.sh
+
+  Скрипт соберёт архив и покажет его хэш — тот самый, который
+  Terraform сравнивает в user_hash и source_hash. Если утилиты zip
+  в системе нет, скрипт соберёт архив средствами Python.
+
+  ВАЖНО: правка index.py сама по себе ничего не изменит. Пока архив
+  не пересобран, хэш остаётся прежним, и Terraform считает, что
+  код не менялся. Это ошибка «я поправил функцию, применил apply,
+  а работает старая версия» — и она встречается в реальной работе
+  чаще, чем хотелось бы. Проверить, что архив свежий:
+
+    terraform plan
+    # yandex_function.api must be replaced
+    #   ~ user_hash = "старый" -> "новый"
+
+  Полезно помнить: тот же принцип у любого кода, который
+  загружается в облако архивом или файлом — Docker-образы,
+  пакеты слоёв, скрипты инициализации.
+
+ШЛЮЗ API ОПИСЫВАЕТСЯ СПЕЦИФИКАЦИЕЙ OPENAPI
+
+  resource "yandex_api_gateway" "api" {
+    name = "${var.project_name}-gateway"
+
+    spec = <<-EOT
+      openapi: 3.0.0
+      info:
+        title: Учебный шлюз API
+        version: 1.0.0
+      paths:
+        /:
+          get:
+            x-yc-apigateway-integration:
+              type: cloud_functions
+              function_id: ${yandex_function.api[0].id}
+              tag: $latest
+              service_account_id: ${yandex_iam_service_account.gateway[0].id}
+    EOT
+  }
+
+ДВЕ ОШИБКИ, КОТОРЫЕ МЫ ПОЛУЧИЛИ ЗДЕСЬ НА ЖИВОМ СТЕНДЕ
+
+  ПЕРВАЯ: у ресурса yandex_api_gateway НЕТ аргумента
+  service_account_id. Авторизация описывается внутри спецификации:
+
+    Error: Unsupported argument
+    An argument named "service_account_id" is not expected here.
+
+  ВТОРАЯ: если сервисный аккаунт не указан, шлюз обращается
+  к функции анонимно и получает отказ:
+
+    {"message":"request to function '<id>' failed,
+     reason: Response code 403 (Forbidden)"}
+
+  Ошибка выглядит как ошибка в коде функции, хотя дело в правах.
+  Сервисному аккаунту шлюза нужна роль на вызов функции.
+
+  И ТРЕТЬЯ, МЕНЕЕ ОЧЕВИДНАЯ: имя роли. Логичное на вид
+  functions.invoker облако не принимает:
+
+    Error: Failed to Update IAM Policy
+    Role 'functions.invoker' not found
+
+  Правильное имя — functions.functionInvoker.
+
+ПРОВЕРКА
+
+  terraform output -raw api_gateway_domain
+  https://d5d7f41fbrj8lv4qqgm6.0ly8ed4d.apigw.yandexcloud.net
+
+  curl -s https://d5d7f41fbrj8lv4qqgm6.0ly8ed4d.apigw.yandexcloud.net/
+  {
+    "message": "Функция создана Terraform",
+    "course": "terraform",
+    "lesson": "7",
+    "request_id": "52e2fe0a-cc7d-4510-8a1d-11dda595a64c",
+    "user_agent": "curl/8.21.0",
+    "event_keys": ["body", "headers", "httpMethod", ...]
+  }
+
+  Прямой вызов функции командной строкой:
+
+    yc serverless function invoke <function_id>
+
+  Здесь важно одно: при прямом вызове событие (event) приходит
+  ПУСТЫМ. Функция, которая сразу обращается к event["headers"],
+  падает:
+
+    {"errorMessage": "'NoneType' object has no attribute 'get'",
+     "errorType": "AttributeError"}
+
+  Мы получили эту ошибку на стенде и добавили в код строку
+  event = event or {} — правило «функция обязана пережить пустой
+  запрос» полезно помнить.
+
+ВЫВОДЫ ПРАКТИКИ
+
+  Результат применения удобно смотреть не в консоли облака,
+  а командами Terraform — тогда значения не нужно искать руками.
+  Файл outputs.tf объявляет идентификатор реестра, путь образа
+  для docker push, идентификатор функции, адрес шлюза и готовые
+  команды проверки. Именно оттуда берётся api_gateway_domain
+  в блоке ПРОВЕРКА выше.
+
+cat > outputs.tf <<'EOF'
+# Выводы практики 7: то, что понадобится дальше и что удобно
+# посмотреть одной командой.
+#
+# Идентификатора кластера здесь нет: кластер создаётся в практике 8,
+# в своём каталоге и со своим состоянием.
+
+# Команды для проверки собираем заранее: так строки остаются
+# короткими, а вывод — тем же самым.
+locals {
+  invoke_function = var.create_serverless ? join("", [
+    "yc serverless function invoke ",
+    yandex_function.api[0].id,
+  ]) : "функция не создавалась"
+
+  call_gateway = var.create_serverless ? join("", [
+    "curl -s https://",
+    yandex_api_gateway.api[0].domain,
+    "/",
+  ]) : "шлюз не создавался"
+}
+
+output "registry_id" {
+  description = "Идентификатор реестра образов"
+  value       = yandex_container_registry.this.id
+}
+
+output "registry_repository" {
+  description = "Имя репозитория для docker push"
+  value       = "${yandex_container_registry.this.id}/app"
+}
+
+output "push_commands" {
+  description = "Как собрать и загрузить образ"
+  value = {
+    login = "yc container registry configure-docker"
+    build = "docker build -t cr.yandex/${yandex_container_registry.this.id}/app:v1 ."
+    push  = "docker push cr.yandex/${yandex_container_registry.this.id}/app:v1"
+  }
+}
+
+output "function_id" {
+  description = "Идентификатор функции"
+  value       = var.create_serverless ? yandex_function.api[0].id : null
+}
+
+output "api_gateway_domain" {
+  description = "Адрес шлюза API"
+  value       = var.create_serverless ? "https://${yandex_api_gateway.api[0].domain}" : null
+}
+
+output "check_commands" {
+  description = "Готовые команды для проверки"
+  value = {
+    invoke_function = local.invoke_function
+    call_gateway    = local.call_gateway
+  }
+}
+EOF
+
+------------------------------------------------------------------
+4. СКОЛЬКО ЭТО СТОИТ
+------------------------------------------------------------------
+
+У этой практики две статьи расходов, и обе маленькие.
+
+  РЕЕСТР ОБРАЗОВ — за хранение: гигабайт в сутки. Пока образов нет,
+  платить не за что. Отсюда политика очистки: она следит, чтобы
+  реестр не рос бесконечно.
+
+  ФУНКЦИЯ И ШЛЮЗ API — за вызовы и время работы. Функция на 128 МБ
+  и 10 мс работы стоит доли копейки; даже сотня вызовов подряд
+  не даст заметной суммы.
+
+  БАКЕТ С КОДОМ — за хранение нескольких килобайт архива. Это
+  настолько мало, что в счёте такие суммы обычно не видны.
+
+Проверить, что ничего не забыто, можно так:
+
+  yc container registry list
+  yc serverless function list
+  yc serverless api-gateway list
+
+
+------------------------------------------------------------------
+5. УБОРКА
+------------------------------------------------------------------
+
+Эту практику можно НЕ убирать: реестр, функция и шлюз стоят
+копейки, а реестр понадобится в упражнениях. Если убирать всё же
+нужно:
+
+  terraform destroy
+
+Что при этом произойдёт:
+
+  * функция и шлюз удалятся сразу;
+  * бакет удалится вместе с архивом — благодаря force_destroy;
+  * реестр удалится вместе с образами, если они там есть.
+
+Проверить, что не осталось ничего:
+
+  yc container registry list
+  yc serverless function list
+
+
+------------------------------------------------------------------
+6. РАЗБОР ПОЛОМОК
+------------------------------------------------------------------
+
+Все ошибки ниже получены на живом стенде — это не пересказ
+документации.
+
+
+  СИМПТОМ: шлюз API отвечает 403 при вызове функции
+  ПРИЧИНА: в спецификации не указан service_account_id интеграции,
+  либо у сервисного аккаунта нет роли functions.functionInvoker.
+  ЧТО ДЕЛАТЬ: добавить параметр в спецификацию и выдать роль.
+
+  СИМПТОМ: Error: Role 'functions.invoker' not found
+  ПРИЧИНА: неверное имя роли. В Яндекс Облаке оно пишется
+  functions.functionInvoker.
+  ЧТО ДЕЛАТЬ: сверять идентификаторы ролей в документации сервиса,
+  а не придумывать по аналогии.
+
+  СИМПТОМ: функция падает с AttributeError про NoneType
+  ПРИЧИНА: при прямом вызове событие пустое, а код сразу обращается
+  к полям события.
+  ЧТО ДЕЛАТЬ: начинать обработчик с event = event or {}.
+
+  СИМПТОМ: изменения кода функции не применяются
+  ПРИЧИНА: у функции не обновился user_hash, или архив не перезалит
+  в бакет.
+  ЧТО ДЕЛАТЬ: пересобрать архив и проверить, что user_hash
+  вычисляется от файла (filemd5), а не вписан руками.
+
+  СИМПТОМ: Error: Unsupported argument для правила политики очистки
+  ПРИЧИНА: придуманное поле (например, блок с запросом).
+  ЧТО ДЕЛАТЬ: сверять поля правила по схеме провайдера:
+  terraform providers schema -json.
+
+
+------------------------------------------------------------------
+7. ЗАДАНИЯ
+------------------------------------------------------------------
+
+  1. Реестр. Соберите минимальный образ (например, nginx со своей
+     страницей), загрузите его в реестр и убедитесь, что политика
+     очистки удаляет старые теги. Подсказка: политику можно
+     запустить вручную через yc.
+
+  2. Функция. Добавьте в функцию второй путь (/health), который
+     возвращает только статус. Опишите его в спецификации шлюза.
+
+  3. Права. Уберите роль functions.functionInvoker у сервисного
+     аккаунта шлюза и проверьте, что шлюз начнёт отвечать 403.
+     Верните роль.
+
+
+------------------------------------------------------------------
+8. ЧТО ДАЛЬШЕ
+------------------------------------------------------------------
+
+Реестр готов, функция отвечает по публичному адресу, а образы
+есть куда складывать. В практике 8 займёмся кластером Kubernetes:
+двумя сервисными аккаунтами с ролями, зональным мастером, группой
+узлов и подключением через kubectl. Кластер возьмёт подсеть из
+модуля сети, который вы делали в практике 3, — поэтому он и вынесен
+в отдельный проект со своим состоянием.

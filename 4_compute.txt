@@ -3,7 +3,7 @@
 Продолжительность: 2 академических часа.
 Провайдер: yandex-cloud/yandex. Практика выполняется в Яндекс Облаке.
 
-ЧТО БУДЕТ К КОНЦУ ЗАНЯТИЯ
+ЧТО БУДЕТ К КОНЦУ ПРАКТИКИ
 
   Вы развернёте веб-сервер, который сам себя настраивает при первом
   запуске (cloud-init), добавите к нему отдельный диск и снимок,
@@ -14,7 +14,7 @@
 ЧТО НУЖНО ЗАРАНЕЕ
 
   * Доступ в облако и состояние (практики 1–2).
-  * Свой модуль сети из практики 3 — мы его переиспользуем.
+  * Свой модуль сети из практики 3 — он переиспользуется и здесь.
   * Публичный SSH-ключ.
 
 ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ ПРО ДЕНЬГИ
@@ -22,12 +22,334 @@
   Группа машин и балансировщик — это уже не одна машина. Даже
   прерываемые машины в количестве двух-трёх плюс NAT-шлюз стоят
   заметно больше, чем одна машина из практики 1. Убирайте стенд
-  сразу после занятия.
+  сразу, как закончите практику.
 
 
 ========================================================================
 ЧАСТЬ 1. БАЗОВАЯ: ОДНА МАШИНА, КОТОРАЯ САМА СЕБЯ НАСТРАИВАЕТ
 ========================================================================
+
+------------------------------------------------------------------
+0. КАТАЛОГ ПРОЕКТА И ФАЙЛЫ
+------------------------------------------------------------------
+
+Правило, которое нарушают чаще всего: ОДИН ПРОЕКТ — ОДИН
+КАТАЛОГ. Terraform работает с состоянием в пределах каталога,
+поэтому файлы разных проектов в одной папке перемешают ресурсы
+и состояние.
+
+Создаём каталог практики:
+
+  mkdir -p ~/terraform-course/work/04-compute
+  cd ~/terraform-course/work/04-compute
+
+Здесь ~/terraform-course — клон репозитория с материалами курса.
+Каталог work/ внутрь репозитория не попадает: он перечислен
+в .gitignore, чтобы ваши эксперименты не смешивались
+с материалами курса.
+
+СТРУКТУРА ПРОЕКТА
+
+  04-compute/
+  ├── cloud-init/
+  │   └── web.yaml
+  ├── ig.tf
+  ├── lb.tf
+  ├── locals.tf
+  ├── network.tf
+  ├── outputs.tf
+  ├── provider.tf
+  ├── snapshot.tf
+  ├── terraform.tfvars.example
+  ├── variables.tf
+  ├── versions.tf
+  └── web-vm.tf
+
+  ../modules/vpc/          общий модуль сети (создан в практике 3)
+    ├── main.tf
+    ├── outputs.tf
+    ├── variables.tf
+    └── versions.tf
+
+  Плюс файлы, которые создаются при работе и в репозиторий
+  не попадают: terraform.tfvars (значения переменных),
+  terraform.tfstate (состояние), .terraform/ (провайдеры).
+  Файл .terraform.lock.hcl, наоборот, нужно сохранить в git:
+  он фиксирует версии провайдеров.
+
+Первый файл — переменные. В нём объявлены все входные значения
+проекта: идентификаторы облака и каталога, ключи, размеры машины
+и диска, флаги группы машин и балансировщика. Отдельно посмотрите
+на блоки validation: неверный размер диска или слишком большое число
+машин Terraform отклонит до обращения в облако, понятной ошибкой.
+
+cat > variables.tf <<'EOF'
+variable "cloud_id" {
+  type        = string
+  description = "Идентификатор облака"
+}
+
+variable "folder_id" {
+  type        = string
+  description = "Идентификатор каталога"
+}
+
+variable "zone" {
+  type        = string
+  description = "Зона доступности"
+  default     = "ru-central1-d"
+}
+
+variable "sa_key_file" {
+  type        = string
+  description = "Путь к авторизованному ключу сервисного аккаунта"
+}
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Путь к публичному SSH-ключу"
+}
+
+variable "project_name" {
+  type        = string
+  description = "Префикс в именах ресурсов"
+  default     = "tf-compute"
+}
+
+variable "image_family" {
+  type        = string
+  description = "Семейство образов загрузочного диска"
+  default     = "ubuntu-2604-lts"
+}
+
+variable "web_vm_cores" {
+  type        = number
+  description = "Ядра веб-сервера"
+  default     = 2
+}
+
+variable "web_vm_memory" {
+  type        = number
+  description = "Память веб-сервера, ГБ"
+  default     = 2
+}
+
+variable "data_disk_size" {
+  type        = number
+  description = "Размер дополнительного диска, ГБ"
+  default     = 5
+
+  validation {
+    condition     = var.data_disk_size >= 1 && var.data_disk_size <= 50
+    error_message = "Размер диска: от 1 до 50 ГБ."
+  }
+}
+
+variable "data_disk_type" {
+  type        = string
+  description = "Тип дополнительного диска"
+  default     = "network-hdd"
+
+  validation {
+    condition = contains(
+      ["network-hdd", "network-ssd", "network-ssd-nonreplicated"],
+      var.data_disk_type
+    )
+    error_message = "Неизвестный тип диска."
+  }
+}
+
+variable "create_snapshot" {
+  type        = bool
+  description = "Создавать ли снимок дополнительного диска"
+  default     = true
+}
+
+variable "ig_size" {
+  type        = number
+  description = "Число машин в группе"
+  default     = 2
+
+  validation {
+    condition     = var.ig_size >= 0 && var.ig_size <= 3
+    error_message = "Для учебного стенда: от 0 до 3 машин."
+  }
+}
+
+variable "ig_autoscaling" {
+  type        = bool
+  description = "Включить автоматическое масштабирование группы"
+  default     = false
+}
+
+variable "create_load_balancer" {
+  type        = bool
+  description = "Создавать ли сетевой балансировщик"
+  default     = true
+}
+EOF
+
+КАК СОЗДАЁМ ФАЙЛЫ
+
+  Файлы можно набрать по тексту практики. Конструкция
+  cat > имя-файла <<'EOF' записывает в файл всё, что введено до
+  строки EOF, поэтому такой блок можно скопировать в терминал
+  целиком. Строки cat и EOF стоят в первом столбце: отступ сломал
+  бы завершение ввода.
+
+  Готовые файлы практики лежат в материалах курса — их можно
+  взять вместо набора по тексту:
+
+  cp -r ~/terraform-course/files/04_compute/. .
+  mkdir -p ../modules
+  cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+  Вторая команда копирует общий модуль сети: в конфигурациях он
+  подключается как source = "../modules/vpc", то есть лежит рядом
+  с каталогом практики, в каталоге work/modules/vpc. Без модуля
+  terraform init остановится с ошибкой:
+
+    Error: Unreadable module directory
+    Error: Module not installed
+
+
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.3"
+
+  required_providers {
+    yandex = {
+      source  = "yandex-cloud/yandex"
+      version = "~> 0.229.0"
+    }
+  }
+}
+EOF
+
+cat > provider.tf <<'EOF'
+provider "yandex" {
+  cloud_id                 = var.cloud_id
+  folder_id                = var.folder_id
+  zone                     = var.zone
+  service_account_key_file = var.sa_key_file
+}
+EOF
+
+cat > locals.tf <<'EOF'
+# Локальные значения практики 4.
+
+locals {
+  # Публичный адрес балансировщика.
+  #
+  # Почему так сложно: блоки listener и external_address_spec в схеме
+  # провайдера объявлены как МНОЖЕСТВА (set), а элементы множества
+  # адресуются не по индексу. Запись вида listener[0] приводит к ошибке:
+  #
+  #   Error: Cannot index a set value
+  #   Block type "listener" is represented by a set of objects, and set
+  #   elements do not have addressable keys.
+  #
+  # Поэтому адрес достаётся выражением for, а функция one() берёт
+  # единственный элемент: если элементов не один, она вернёт ошибку —
+  # и это полезно, потому что молча взять «первый попавшийся» здесь
+  # как раз опаснее всего.
+  #
+  # Запомните этот приём: он нужен и для других ресурсов провайдера,
+  # где вложенные блоки объявлены множествами.
+  load_balancer_address = var.create_load_balancer ? one([
+    for listener in yandex_lb_network_load_balancer.web[0].listener :
+    one(listener.external_address_spec).address
+  ]) : null
+}
+EOF
+
+cat > network.tf <<'EOF'
+# Сеть берём из модуля, который написали в практике 3.
+# Это и есть смысл модуля: описание сети не копируется в каждый проект.
+
+module "vpc" {
+  source = "../modules/vpc"
+
+  network_name = "${var.project_name}-net"
+
+  subnets = {
+    web = {
+      zone = var.zone
+      cidr = "10.60.10.0/24"
+    }
+  }
+
+  # Веб-серверу нужен не только SSH, но и HTTP.
+  allowed_ports = [22, 80]
+
+  # NAT-шлюз: выход в интернет для машин группы.
+  #
+  # Машины группы мы создаём БЕЗ публичных адресов — так правильно:
+  # трафик к ним идёт через балансировщик, а наружу светить каждую
+  # машину незачем. Но тогда у них нет маршрута по умолчанию, и любая
+  # попытка обратиться в интернет (например, установить пакет из
+  # cloud-init) заканчивается тайм-аутом. NAT-шлюз и таблица
+  # маршрутизации решают эту задачу.
+  #
+  # Это проверено на живом стенде: без шлюза health check группы
+  # показывал «Instance is unhealthy», машины пересоздавались по кругу,
+  # а nginx так и не устанавливался.
+  #
+  # Шлюз платный: если в подсети нет машин без публичных адресов,
+  # его не включают.
+  create_nat_gateway = true
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+EOF
+
+cat > terraform.tfvars.example <<'EOF'
+# Пример значений переменных практики 4.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-compute"
+
+# Веб-сервер.
+web_vm_cores  = 2
+web_vm_memory = 2
+
+# Дополнительный диск и снимок.
+data_disk_type = "network-hdd"
+data_disk_size = 5
+create_snapshot = true
+
+# Группа машин: сначала фиксированное число, потом попробуйте
+# включить автоматическое масштабирование.
+ig_size        = 2
+ig_autoscaling = false
+
+create_load_balancer = true
+EOF
+
+МОДУЛЬ СЕТИ ВРУЧНУЮ
+
+Модуль сети создан в практике 3 и используется всеми последующими
+практиками, кроме практики 7: реестру, функции и шлюзу API сеть
+не нужна. Если вы копировали готовые файлы, он уже на месте.
+Если создаёте всё сами — создайте и модуль:
+
+  mkdir -p ../modules/vpc
+
+Содержимое четырёх файлов модуля приведено в практике 3, в разделе
+«МОДУЛЬ СЕТИ ЦЕЛИКОМ», или возьмите готовые:
+
+  cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+Код каждого файла проекта приведён в том разделе, где этот файл
+разбирается.
 
 ------------------------------------------------------------------
 1. ИЗ ЧЕГО СОСТОИТ ВИРТУАЛЬНАЯ МАШИНА
@@ -57,6 +379,154 @@
   и ru-central1-e, а документация рекомендует для новых проектов
   именно -d. Используем standard-v3.
 
+Машина целиком описана в файле web-vm.tf. В нём четыре части:
+источник данных об образе, ресурс машины yandex_compute_instance.web,
+дополнительный диск и пример машины с подключённым диском.
+Разделы 2–5 разбирают отдельные блоки этого файла.
+
+cat > web-vm.tf <<'EOF'
+# Веб-сервер: загрузочный диск из образа, дополнительный диск для данных,
+# начальная настройка через cloud-init.
+
+data "yandex_compute_image" "os" {
+  family = var.image_family
+}
+
+resource "yandex_compute_instance" "web" {
+  name        = "${var.project_name}-web"
+  description = "Учебный веб-сервер курса Terraform"
+
+  zone        = var.zone
+  platform_id = "standard-v3"
+
+  allow_stopping_for_update = true
+
+  resources {
+    cores  = var.web_vm_cores
+    memory = var.web_vm_memory
+
+    # Гарантированная доля ядра. 20 % — дешёвый вариант для учебного
+    # стенда.
+    # В рабочей среде ставят 100 %: иначе производительность зависит
+    # от того, насколько загружены соседи по физическому серверу.
+    core_fraction = 20
+  }
+
+  scheduling_policy {
+    # Прерываемая машина: облако вправе остановить её в любой момент.
+    # Для веб-сервера в рабочей среде это недопустимо, для учебного
+    # стенда —
+    # экономия. Данные на загрузочном диске при этом сохраняются.
+    preemptible = true
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.os.id
+      type     = "network-hdd"
+      size     = 10
+    }
+  }
+
+  network_interface {
+    subnet_id          = module.vpc.subnet_ids["web"]
+    nat                = true
+    security_group_ids = [module.vpc.security_group_id]
+  }
+
+  metadata = {
+    # Формат ssh-keys: "пользователь:публичный ключ".
+    ssh-keys = "ubuntu:${file(var.ssh_public_key)}"
+
+    # Начальная настройка. Подробности — в файле cloud-init/web.yaml.
+    user-data = file("${path.module}/cloud-init/web.yaml")
+
+    # Включить последовательную консоль: помогает, когда машина
+    # не поднимается и по SSH не пускает.
+    serial-port-enable = "1"
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+    role   = "web"
+  }
+}
+
+# Дополнительный диск.
+#
+# Зачем отдельный ресурс, если диск можно описать внутри машины:
+#   * диск живёт независимо от машины: её можно удалить и пересоздать,
+#     а данные останутся;
+#   * на диск можно делать снимки;
+#   * диск можно перенести на другую машину.
+#
+# Обратите внимание на параметр attach_mode: для сетевых дисков
+# в Яндекс Облаке используется READ_WRITE.
+resource "yandex_compute_disk" "data" {
+  name = "${var.project_name}-data"
+  type = var.data_disk_type
+  zone = var.zone
+  size = var.data_disk_size
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+    role   = "data"
+  }
+}
+
+resource "yandex_compute_instance" "web_with_disk" {
+  # Пример условного создания: машина с дополнительным диском
+  # создаётся только в том случае, когда диск действительно нужен.
+  # count = 0 означает «ресурса нет».
+  count = 0
+
+  name        = "${var.project_name}-web-data"
+  description = "Машина с дополнительным диском (пример монтирования)"
+  zone        = var.zone
+  platform_id = "standard-v3"
+
+  resources {
+    cores         = 2
+    memory        = 2
+    core_fraction = 20
+  }
+
+  scheduling_policy {
+    preemptible = true
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.os.id
+      type     = "network-hdd"
+      size     = 10
+    }
+  }
+
+  secondary_disk {
+    disk_id     = yandex_compute_disk.data.id
+    auto_delete = false
+  }
+
+  network_interface {
+    subnet_id          = module.vpc.subnet_ids["web"]
+    nat                = true
+    security_group_ids = [module.vpc.security_group_id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:${file(var.ssh_public_key)}"
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+EOF
+
 ------------------------------------------------------------------
 2. ПРЕРЫВАЕМЫЕ МАШИНЫ И ДОЛЯ ЯДРА: ЭКОНОМИЯ И ЕЁ ЦЕНА
 ------------------------------------------------------------------
@@ -72,8 +542,9 @@
   }
 
 Прерываемая машина может быть остановлена облаком в любой момент:
-обычно предупреждение приходит за несколько секунд. Для занятий это
-разумная экономия, для рабочей нагрузки — нет. Запомните правило:
+обычно предупреждение приходит за несколько секунд. Для учебного
+стенда это разумная экономия, для рабочей нагрузки — нет. Запомните
+правило:
 прерываемые машины годятся там, где потеря одной машины ничего
 не ломает, — то есть внутри группы под балансировщиком.
 
@@ -91,9 +562,10 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   }
 
 Источник данных спрашивает у облака, какой образ сейчас последний
-в семействе. Мы разбирали это в практике 1; здесь важно следствие:
-образ может обновиться, и план однажды предложит пересоздать машину.
-Лечится это либо закреплением версии, либо жизненным циклом:
+в семействе. Подробно это разбиралось в практике 1; здесь важно
+следствие: образ может обновиться, и план однажды предложит
+пересоздать машину. Лечится это либо закреплением версии, либо
+жизненным циклом:
 
   lifecycle {
     ignore_changes = [boot_disk[0].initialize_params[0].image_id]
@@ -142,6 +614,73 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   машину вместе с данными, а потом платить за «потерянный» диск,
   который продолжает занимать место в облаке.
 
+Снимки описаны отдельным файлом snapshot.tf. В нём два ресурса:
+снимок дополнительного диска и расписание, по которому облако снимает
+копии само. Оба ресурса создаются только при create_snapshot = true.
+
+cat > snapshot.tf <<'EOF'
+# Снимки дисков: резервная копия на уровне облака.
+#
+# Снимок хранит состояние диска на момент создания. Из снимка можно
+# создать новый диск и подключить его к другой машине.
+#
+# Важно: снимок НЕ равен резервной копии данных приложения. Если
+# приложение пишет в диск в момент снятия снимка, данные на снимке
+# будут согласованы на уровне файловой системы, но не на уровне
+# приложения. Для баз данных нужны штатные средства резервного
+# копирования (практика 6).
+
+resource "yandex_compute_snapshot" "data" {
+  count = var.create_snapshot ? 1 : 0
+
+  name        = "${var.project_name}-data-snapshot"
+  description = "Снимок дополнительного диска, создан Terraform"
+
+  source_disk_id = yandex_compute_disk.data.id
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+
+# Расписание снимков.
+#
+# Вместо ручного создания снимков описывают расписание: облако само
+# снимает копии по cron-выражению. Так же можно описать политику
+# хранения: сколько снимков держать и как часто удалять старые.
+#
+# Расписание бесплатно, платят только за хранение самих снимков.
+# Поэтому расписание стоит заводить вместе с политикой хранения,
+# иначе снимки будут копиться и занимать место.
+resource "yandex_compute_snapshot_schedule" "data" {
+  count = var.create_snapshot ? 1 : 0
+
+  name = "${var.project_name}-data-schedule"
+
+  # Снимок раз в сутки в 05:00 по московскому времени.
+  schedule_policy {
+    expression = "0 5 * * *"
+  }
+
+  # Что именно снимать: конкретные диски по идентификатору
+  # или все диски с определёнными метками.
+  disk_ids = [yandex_compute_disk.data.id]
+
+  snapshot_spec {
+    description = "Ежедневный снимок диска данных"
+    labels = {
+      course  = "terraform"
+      lesson  = "4"
+      created = "schedule"
+    }
+  }
+
+  # Политика хранения: не больше 7 снимков, остальные удаляются.
+  retention_period = "168h"
+}
+EOF
+
 Снимок:
 
   resource "yandex_compute_snapshot" "data" {
@@ -186,13 +725,85 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
     user-data = file("${path.module}/cloud-init/web.yaml")
   }
 
-Что делает наш файл:
+Что делает этот файл:
 
   1. обновляет список пакетов и ставит nginx;
   2. записывает страницу index.html;
   3. дописывает в страницу внешний и внутренний адрес, полученные
      из службы метаданных;
   4. включает и перезапускает nginx.
+
+Файл лежит в подкаталоге cloud-init. Каталог создаётся отдельно,
+и только затем в него записывается файл:
+
+  mkdir -p cloud-init
+
+cat > cloud-init/web.yaml <<'EOF'
+#cloud-config
+# Начальная настройка виртуальной машины.
+#
+# Этот файл передаётся в облако в метаданных (аргумент user-data)
+# и исполняется агентом cloud-init при первом запуске машины.
+#
+# Что здесь важно:
+#   * формат — YAML, первая строка #cloud-config обязательна;
+#   * отступы только пробелами, табуляция ломает разбор;
+#   * файл читается ОДИН РАЗ при первой загрузке. Изменения в этом
+#     файле не применяются к уже работающей машине: чтобы увидеть
+#     новый вариант, машину нужно пересоздать;
+#   * ошибки в cloud-init не останавливают создание машины — она
+#     поднимется, но без настройки. Смотреть журнал:
+#       sudo cat /var/log/cloud-init-output.log
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Учебный веб-сервер</title>
+      </head>
+      <body>
+        <h1>Веб-сервер создан Terraform</h1>
+        <p>Страница записана файлом cloud-init.</p>
+      </body>
+      </html>
+
+runcmd:
+  # Внешний адрес машины из службы метаданных Яндекс Облака.
+  #
+  # ВАЖНО: это НЕ тот адрес, что используется в AWS
+  # (169.254.169.254/latest/meta-data/...). В Яндекс Облаке служба
+  # метаданных отвечает по пути computeMetadata/v1 и требует заголовок
+  # Metadata-Flavor: Google. Запрос без этого заголовка вернёт ошибку.
+  - |
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ip)
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" \
+      http://169.254.169.254/computeMetadata/v1/instance/hostname)
+
+    printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP" >> /var/www/html/index.html
+    printf '<p>Внутренний адрес: %s</p>\n' "$INTERNAL_IP" >> /var/www/html/index.html
+    printf '<p>Имя машины: %s</p>\n' "$HOSTNAME" >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx
+
+# Отдельный файл со признаком того, что настройка дошла до конца.
+# Удобно для проверок: если файла нет — cloud-init не доработал.
+final_message: "Настройка завершена за $UPTIME секунд"
+EOF
 
 ТРИ ПРАВИЛА CLOUD-INIT, О КОТОРЫХ НАДО ЗНАТЬ
 
@@ -203,7 +814,8 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   ОДИН РАЗ. Файл исполняется при ПЕРВОЙ загрузке машины. Правка
   файла в репозитории не изменит уже работающую машину: чтобы
   применить новый вариант, машину нужно пересоздать. Это ловушка:
-  студент правит index.html, применяет apply, а страница не меняется.
+  правка index.html ничего не меняет: apply проходит, а страница
+  остаётся прежней.
 
   ОШИБКИ НЕ ВИДНЫ СНАРУЖИ. Если cloud-init упал, машина всё равно
   создастся и будет «работать» — просто без веб-сервера. Смотреть
@@ -251,10 +863,12 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   terraform plan
   terraform apply
 
-В нашем прогоне создалось 11 ресурсов: сеть с подсетью и группой
+В этом прогоне создалось 11 ресурсов: сеть с подсетью и группой
 безопасности, веб-сервер, дополнительный диск, снимок, расписание
 снимков, сервисный аккаунт группы с двумя ролями и сама группа
 (пока пустая).
+
+  Ожидаемый вывод:
 
   Apply complete! Resources: 11 added, 0 changed, 0 destroyed.
 
@@ -267,6 +881,8 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
 машине минуту-две):
 
   curl -s http://51.250.40.242/
+
+  Ожидаемый вывод:
 
   <!DOCTYPE html>
   <html lang="ru">
@@ -298,7 +914,7 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
 7. ОШИБКА ПЕРВАЯ: ИСХОДЯЩИЙ ТРАФИК ЗАКРЫТ, APT НЕ РАБОТАЕТ
 ------------------------------------------------------------------
 
-Эту ошибку мы получили на занятии своими руками, и она же была
+Эту ошибку легко сделать своими руками, и она же была
 в прежней версии курса. Симптом: машина создаётся, SSH работает,
 а страницы нет. В журнале cloud-init:
 
@@ -333,9 +949,9 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
     v4_cidr_blocks = ["0.0.0.0/0"]
   }
 
-  В нашем модуле сети это правило теперь описано именно так, и в нём
+  В модуле сети из практики 3 правило описано именно так, и рядом
   оставлен комментарий с текстом этой ошибки — чтобы через год никто
-  снова не «оптимизировал» его до одного порта.
+  снова не «оптимизировал» правило до одного порта.
 
   Как перезапустить настройку, не создавая машину заново? Никак:
   cloud-init читает метаданные один раз. Правильный способ — пересоздать
@@ -364,7 +980,7 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
 
     status_message = "Instance is unhealthy for 9m 21s."
 
-ПРИЧИНА: машины группы мы создали БЕЗ публичных адресов (nat = false) —
+ПРИЧИНА: машины группы созданы БЕЗ публичных адресов (nat = false) —
 это правильно, наружу смотрит балансировщик. Но в Яндекс Облаке
 у машины без публичного адреса НЕТ маршрута по умолчанию, то есть
 интернета нет вовсе. cloud-init не смог установить nginx, проверка
@@ -372,8 +988,8 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
 по кругу.
 
 ЧТО ДЕЛАТЬ: создать в сети NAT-шлюз и таблицу маршрутизации, а подсети
-дать ссылку на эту таблицу. В нашем модуле сети это включается одной
-переменной:
+дать ссылку на эту таблицу. В модуле сети из практики 3 это включается
+одной переменной:
 
   module "vpc" {
     source = "../modules/vpc"
@@ -414,6 +1030,63 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   проверку здоровья» — про маршрут в интернет (NAT-шлюз). Внешне они
   выглядят одинаково: сервис не работает, машина жива.
 
+Последний файл части 1 — outputs.tf. Выводы печатаются после apply
+и избавляют от ручного поиска: идентификаторы диска и снимка,
+публичный адрес машины, команда проверки страницы. Два последних
+вывода относятся к балансировщику, он появится во второй части.
+
+cat > outputs.tf <<'EOF'
+output "web_vm_external_ip" {
+  description = "Публичный адрес веб-сервера"
+  value       = yandex_compute_instance.web.network_interface[0].nat_ip_address
+}
+
+output "web_vm_fqdn" {
+  description = "Внутреннее доменное имя веб-сервера"
+  value       = yandex_compute_instance.web.fqdn
+}
+
+output "web_page_command" {
+  description = "Команда для проверки страницы, отданной cloud-init"
+  value       = "curl -s http://${yandex_compute_instance.web.network_interface[0].nat_ip_address}/"
+}
+
+output "data_disk_id" {
+  description = "Идентификатор дополнительного диска"
+  value       = yandex_compute_disk.data.id
+}
+
+output "snapshot_id" {
+  description = "Идентификатор снимка диска"
+  value       = var.create_snapshot ? yandex_compute_snapshot.data[0].id : null
+}
+
+output "instance_group_size" {
+  description = "Сколько машин сейчас в группе"
+  value       = length(yandex_compute_instance_group.web.instances)
+}
+
+output "instance_group_ips" {
+  description = "Внутренние адреса машин группы"
+  value = [
+    for vm in yandex_compute_instance_group.web.instances :
+    vm.network_interface[0].ip_address
+  ]
+}
+
+output "load_balancer_ip" {
+  description = "Публичный адрес балансировщика"
+  value       = local.load_balancer_address
+}
+
+output "load_balancer_check_command" {
+  description = "Команда проверки балансировщика: четыре запроса подряд"
+  value = local.load_balancer_address == null ? null : (
+    "for i in 1 2 3 4; do curl -s http://${local.load_balancer_address}/ | grep -o 'Имя машины: [^<]*'; done"
+  )
+}
+EOF
+
 
 ========================================================================
 ЧАСТЬ 2. ПРОДОЛЖЕНИЕ: ГРУППА МАШИН И БАЛАНСИРОВЩИК
@@ -431,6 +1104,188 @@ core_fraction = 20 означает «гарантируется 20 % ядра»
   * изменение числа машин под нагрузку.
 
 Всё это описывается одним ресурсом. Разберём его по частям.
+Группа целиком описана в файле ig.tf: сервисный аккаунт и его права,
+шаблон одной машины, политика масштабирования, размещение, политика
+обновления и проверка здоровья.
+
+cat > ig.tf <<'EOF'
+# Группа виртуальных машин.
+#
+# Группа — это способ сказать «мне нужно N одинаковых машин, следи
+# за ними сам»: облако само создаст их по шаблону, заменит упавшие
+# и (при желании) изменит их число под нагрузку.
+
+# Сервисный аккаунт для группы. Группа действует от его имени:
+# создаёт машины, подключает диски, регистрирует их в балансировщике.
+resource "yandex_iam_service_account" "ig" {
+  name        = "${var.project_name}-ig-sa"
+  description = "Сервисный аккаунт для группы виртуальных машин"
+}
+
+# Права сервисного аккаунта группы.
+#
+# compute.editor — управлять виртуальными машинами и дисками;
+# vpc.user — подключать машины к подсетям и группам безопасности.
+#
+# Выдавать группе роль editor на каталог не нужно: это шире, чем
+# требуется. Чем меньше прав у сервисного аккаунта, тем меньше
+# последствия, если он скомпрометирован.
+resource "yandex_resourcemanager_folder_iam_member" "ig_compute" {
+  folder_id = var.folder_id
+  role      = "compute.editor"
+  member    = "serviceAccount:${yandex_iam_service_account.ig.id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "ig_vpc" {
+  folder_id = var.folder_id
+  role      = "vpc.user"
+  member    = "serviceAccount:${yandex_iam_service_account.ig.id}"
+}
+
+resource "yandex_compute_instance_group" "web" {
+  name               = "${var.project_name}-ig"
+  description        = "Группа веб-серверов, создана Terraform"
+  folder_id          = var.folder_id
+  service_account_id = yandex_iam_service_account.ig.id
+
+  # Защита от случайного удаления. При true terraform destroy
+  # не сможет удалить группу, пока флаг не снят руками.
+  deletion_protection = false
+
+  # Группа должна создаваться после выдачи прав сервисному аккаунту:
+  # иначе облако откажет в создании машин.
+  depends_on = [
+    yandex_resourcemanager_folder_iam_member.ig_compute,
+    yandex_resourcemanager_folder_iam_member.ig_vpc,
+  ]
+
+  # Шаблон машины. Всё, что описывает одну машину, живёт здесь.
+  instance_template {
+    platform_id = "standard-v3"
+
+    resources {
+      cores         = 2
+      memory        = 2
+      core_fraction = 20
+    }
+
+    scheduling_policy {
+      preemptible = true
+    }
+
+    boot_disk {
+      mode = "READ_WRITE"
+      initialize_params {
+        image_id = data.yandex_compute_image.os.id
+        type     = "network-hdd"
+        size     = 10
+      }
+    }
+
+    network_interface {
+      network_id         = module.vpc.network_id
+      subnet_ids         = [module.vpc.subnet_ids["web"]]
+      security_group_ids = [module.vpc.security_group_id]
+
+      # Внешние адреса машинам группы не нужны: трафик приходит
+      # через балансировщик, а доступ для отладки — через него же.
+      nat = false
+    }
+
+    metadata = {
+      ssh-keys  = "ubuntu:${file(var.ssh_public_key)}"
+      user-data = file("${path.module}/cloud-init/web.yaml")
+    }
+
+    labels = {
+      course = "terraform"
+      lesson = "4"
+      role   = "web"
+    }
+  }
+
+  # Сколько машин держать.
+  #
+  # fixed_scale — фиксированное число: просто и предсказуемо.
+  # auto_scale  — облако само меняет число машин по нагрузке на CPU.
+  # Ниже показаны оба варианта, выбор — переменной.
+  dynamic "scale_policy" {
+    for_each = var.ig_autoscaling ? [1] : []
+
+    content {
+      auto_scale {
+        min_zone_size          = 1
+        max_size               = 3
+        initial_size           = var.ig_size
+        measurement_duration   = 60
+        warmup_duration        = 120
+        cpu_utilization_target = 60
+      }
+    }
+  }
+
+  dynamic "scale_policy" {
+    for_each = var.ig_autoscaling ? [] : [1]
+
+    content {
+      fixed_scale {
+        size = var.ig_size
+      }
+    }
+  }
+
+  # В каких зонах размещать машины группы.
+  # Для отказоустойчивости перечисляют несколько зон — тогда машины
+  # распределятся между ними.
+  allocation_policy {
+    zones = [var.zone]
+  }
+
+  # Как обновлять машины группы при изменении шаблона.
+  #
+  # max_unavailable — сколько машин можно вывести из строя одновременно;
+  # max_expansion   — сколько машин можно временно добавить.
+  # Если оба значения нулевые, обновление невозможно: облаку негде
+  # разместить новые машины и некого вывести из строя.
+  #
+  # strategy принимает только два значения:
+  #   proactive     — машины меняются сразу после правки шаблона,
+  #                   группа сама приводит себя к новому виду;
+  #   opportunistic — замена происходит не сразу, а когда машина
+  #                   пересоздаётся по другой причине (например,
+  #                   её заменил health check).
+  # Для учебного стенда удобнее proactive: изменения видны сразу.
+  deploy_policy {
+    max_unavailable = 1
+    max_expansion   = 1
+    strategy        = "proactive"
+  }
+
+  # Проверка состояния машин.
+  #
+  # Без проверки группа считает машину здоровой по факту запуска,
+  # даже если приложение на ней не поднялось. С проверкой облако
+  # само пересоздаст машину, которая не отвечает, — это и называется
+  # самовосстановлением (autohealing).
+  health_check {
+    interval = 15
+    timeout  = 5
+
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+
+    http_options {
+      port = 80
+      path = "/"
+    }
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+EOF
 
 ------------------------------------------------------------------
 10. СЕРВИСНЫЙ АККАУНТ ГРУППЫ
@@ -592,7 +1447,89 @@ yandex_compute_instance, переезжает сюда.
 ------------------------------------------------------------------
 
 Балансировщик состоит из двух ресурсов: целевая группа (что
-балансировать) и сам балансировщик (как принимать трафик).
+балансировать) и сам балансировщик (как принимать трафик). Оба
+ресурса описаны в файле lb.tf и создаются только при
+create_load_balancer = true.
+
+cat > lb.tf <<'EOF'
+# Сетевой балансировщик.
+#
+# Задача: у нас несколько одинаковых веб-серверов, и нужен один адрес,
+# по которому к ним обращаться. Балансировщик распределяет запросы
+# между машинами и перестаёт отправлять их на нездоровые.
+
+resource "yandex_lb_target_group" "web" {
+  count = var.create_load_balancer ? 1 : 0
+
+  name      = "${var.project_name}-tg"
+  folder_id = var.folder_id
+
+  # Цели — это машины, между которыми распределяется трафик.
+  # Мы не перечисляем их руками: берём из группы машин, чтобы список
+  # целей сам следовал за изменениями группы.
+  dynamic "target" {
+    for_each = yandex_compute_instance_group.web.instances
+
+    content {
+      subnet_id = target.value.network_interface[0].subnet_id
+      address   = target.value.network_interface[0].ip_address
+    }
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+
+resource "yandex_lb_network_load_balancer" "web" {
+  count = var.create_load_balancer ? 1 : 0
+
+  name      = "${var.project_name}-nlb"
+  folder_id = var.folder_id
+  type      = "external"
+
+  # Слушатель: какой порт балансировщик принимает снаружи.
+  listener {
+    name        = "http"
+    port        = 80
+    target_port = 80
+    protocol    = "tcp"
+
+    external_address_spec {
+      ip_version = "ipv4"
+    }
+  }
+
+  attached_target_group {
+    target_group_id = yandex_lb_target_group.web[0].id
+
+    # Проверка состояния на стороне балансировщика. Она независима
+    # от healthcheck группы машин: балансировщик сам решает, какие
+    # цели считать живыми.
+    healthcheck {
+      name     = "http-check"
+      interval = 5
+      timeout  = 3
+
+      healthy_threshold   = 2
+      unhealthy_threshold = 3
+
+      http_options {
+        port = 80
+        path = "/"
+      }
+    }
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "4"
+  }
+}
+EOF
+
+Разберём файл по частям.
 
   resource "yandex_lb_target_group" "web" {
     name = "${var.project_name}-tg"
@@ -649,6 +1586,8 @@ yandex_compute_instance, переезжает сюда.
   for i in 1 2 3 4 5 6; do
     curl -s http://158.160.238.215/ | grep -o 'Имя машины: [^<]*'
   done
+
+  Ожидаемый вывод:
 
   Имя машины: cl1e6qvb4ghj6f9tfogh-yxor.ru-central1.internal
   Имя машины: cl1e6qvb4ghj6f9tfogh-upew.ru-central1.internal
@@ -723,7 +1662,7 @@ yandex_compute_instance, переезжает сюда.
   Проверить журнал cloud-init на машине группы — проще всего временно
   дать машине публичный адрес (nat = true) и зайти по SSH.
 
-  СИМПТОМ: после занятия остались диски и адреса
+  СИМПТОМ: после практики остались диски и адреса
   ПРИЧИНА: auto_delete = false у дополнительного диска, статические
   адреса и NAT-шлюз живут отдельно от машин.
   ЧТО ДЕЛАТЬ: проверить списки дисков, адресов и шлюзов командой yc.

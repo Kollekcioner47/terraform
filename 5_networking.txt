@@ -3,7 +3,7 @@
 Продолжительность: 2 академических часа.
 Провайдер: yandex-cloud/yandex. Практика выполняется в Яндекс Облаке.
 
-ЧТО БУДЕТ К КОНЦУ ЗАНЯТИЯ
+ЧТО БУДЕТ К КОНЦУ ПРАКТИКИ
 
   Вы соберёте сеть из трёх подсетей в трёх зонах доступности,
   замените «разрешить всё» на свои группы безопасности с правилами
@@ -29,6 +29,312 @@
 ========================================================================
 ЧАСТЬ 1. БАЗОВАЯ
 ========================================================================
+
+------------------------------------------------------------------
+0. КАТАЛОГ ПРОЕКТА И ФАЙЛЫ
+------------------------------------------------------------------
+
+Правило, которое нарушают чаще всего: ОДИН ПРОЕКТ — ОДИН
+КАТАЛОГ. Terraform работает с состоянием в пределах каталога,
+поэтому файлы разных проектов в одной папке перемешают ресурсы
+и состояние.
+
+Создаём каталог практики:
+
+  mkdir -p ~/terraform-course/work/05-networking
+  cd ~/terraform-course/work/05-networking
+
+Здесь ~/terraform-course — клон репозитория с материалами курса.
+Каталог work/ внутрь репозитория не попадает: он перечислен
+в .gitignore, чтобы ваши эксперименты не смешивались
+с материалами курса.
+
+СТРУКТУРА ПРОЕКТА
+
+  05-networking/
+  ├── address.tf
+  ├── alb.tf
+  ├── cloud-init/
+  │   └── web.yaml
+  ├── dns.tf
+  ├── locals.tf
+  ├── network.tf
+  ├── outputs.tf
+  ├── provider.tf
+  ├── security.tf
+  ├── terraform.tfvars.example
+  ├── variables.tf
+  ├── versions.tf
+  └── web-vm.tf
+
+  Плюс файлы, которые создаются при работе и в репозиторий
+  не попадают: terraform.tfvars (значения переменных),
+  terraform.tfstate (состояние), .terraform/ (провайдеры).
+  Файл .terraform.lock.hcl, наоборот, нужно сохранить в git:
+  он фиксирует версии провайдеров.
+
+КАК СОЗДАЁМ ФАЙЛЫ
+
+  Файлы можно набрать по тексту практики. Конструкция
+  cat > имя-файла <<'EOF' записывает в файл всё, что введено до
+  строки EOF, поэтому такой блок можно скопировать в терминал
+  целиком. Строки cat и EOF стоят в первом столбце: отступ сломал
+  бы завершение ввода.
+
+  Готовые файлы практики лежат в материалах курса — их можно
+  взять вместо набора по тексту:
+
+  cp -r ~/terraform-course/files/05_networking/. .
+
+
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.3"
+
+  required_providers {
+    yandex = {
+      source  = "yandex-cloud/yandex"
+      version = "~> 0.229.0"
+    }
+  }
+}
+EOF
+
+cat > provider.tf <<'EOF'
+provider "yandex" {
+  cloud_id                 = var.cloud_id
+  folder_id                = var.folder_id
+  zone                     = var.zone
+  service_account_key_file = var.sa_key_file
+}
+EOF
+
+cat > locals.tf <<'EOF'
+# Локальные значения практики 5.
+
+locals {
+  # Адрес прикладного балансировщика.
+  #
+  # Достать его непросто: listener — список, внутри endpoint — список,
+  # внутри address — список, и только внутри него external_ipv4_address
+  # с самим адресом. Вложенность объясняется тем, что слушателей,
+  # точек входа и адресов может быть несколько.
+  #
+  # Вторая сложность: пока балансировщик ещё не создан, адреса нет
+  # вовсе, и обращение по индексу [0] к пустому списку даёт ошибку:
+  #
+  #   Error: Invalid index
+  #   The given key does not identify an element in this collection value:
+  #   the collection has no elements.
+  #
+  # Поэтому выражение обёрнуто в try(): если вычислить не удалось,
+  # вывод равен null, а не ошибке. Так план проходит и до создания
+  # балансировщика, и после него.
+  alb_address = var.create_alb ? try(
+    one([
+      for endpoint in yandex_alb_load_balancer.web[0].listener[0].endpoint :
+      one(endpoint.address).external_ipv4_address[0].address
+    ]),
+    null
+  ) : null
+
+  # Что открыто наружу на веб-серверах — для вывода и для проверок.
+  public_ports = sort(var.web_ports)
+
+  # Карта «зона -> имя подсети»: помогает понять, какие зоны покрыты.
+  zone_to_subnet = { for name, s in var.subnets : s.zone => name }
+}
+EOF
+
+cat > address.tf <<'EOF'
+# Статический публичный адрес.
+#
+# Проблема, которую он решает: динамический адрес живёт, пока машина
+# работает. В практике 1 мы это увидели своими глазами — после
+# изменения размеров машина перезапустилась, и внешний адрес сменился
+# со 158.160.197.131 на 158.160.195.62. Для веб-сервера, на который
+# смотрят записи DNS и правила файрвола клиентов, это недопустимо.
+#
+# Статический адрес — отдельный ресурс. Он существует независимо
+# от машины: машину можно удалить и создать заново, адрес останется.
+# За закреплённый адрес берут плату, поэтому неиспользуемые адреса
+# надо освобождать.
+
+resource "yandex_vpc_address" "web" {
+  name = "${var.project_name}-web-ip"
+
+  external_ipv4_address {
+    zone_id = var.zone
+
+    # Защита от DDoS подключается здесь же:
+    # ddos_protection_provider = "qrator"
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+EOF
+
+cat > terraform.tfvars.example <<'EOF'
+# Пример значений переменных практики 5.
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+project_name = "tf-net"
+
+# Подсети в трёх зонах. Зона ru-central1-c больше не существует;
+# актуальны a, b, d (рекомендуемая для новых проектов) и e.
+subnets = {
+  web-a = {
+    zone = "ru-central1-a"
+    cidr = "10.70.10.0/24"
+  }
+  web-b = {
+    zone = "ru-central1-b"
+    cidr = "10.70.20.0/24"
+  }
+  web-d = {
+    zone = "ru-central1-d"
+    cidr = "10.70.30.0/24"
+  }
+}
+
+web_ports = [80]
+
+# Своя доменная зона. Для учебного стенда годится любое имя, но помните:
+# пока домен не делегирован облаку у регистратора, зона не работает
+# в интернете. Если у вас есть свой домен — укажите его.
+dns_zone        = "tf-course.example.com."
+dns_record_name = "web"
+
+create_alb         = true
+enable_nat_gateway = true
+EOF
+
+Переменные практики собраны в variables.tf. Главное в нём — карта
+subnets: подсети заданы данными, а не кодом, поэтому новую зону
+можно добавить одной записью, не переписывая ресурсы. Целостность
+значений стерегут два блока validation: имя зоны DNS обязано
+оканчиваться точкой, а список подсетей не может быть пустым.
+
+cat > variables.tf <<'EOF'
+variable "cloud_id" {
+  type        = string
+  description = "Идентификатор облака"
+}
+
+variable "folder_id" {
+  type        = string
+  description = "Идентификатор каталога"
+}
+
+variable "zone" {
+  type        = string
+  description = "Основная зона доступности"
+  default     = "ru-central1-d"
+}
+
+variable "sa_key_file" {
+  type        = string
+  description = "Путь к авторизованному ключу сервисного аккаунта"
+}
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Путь к публичному SSH-ключу"
+}
+
+variable "project_name" {
+  type        = string
+  description = "Префикс в именах ресурсов"
+  default     = "tf-net"
+}
+
+variable "image_family" {
+  type        = string
+  description = "Семейство образов"
+  default     = "ubuntu-2604-lts"
+}
+
+# Подсети: по одной в каждой зоне.
+#
+# Три зоны — не украшение. Машины в разных зонах переживают отказ
+# одной зоны доступности. Но зональные ресурсы, такие как подсеть,
+# машина и диск, к зоне привязаны: перенести подсеть из зоны в зону
+# нельзя, её можно только создать заново.
+variable "subnets" {
+  type = map(object({
+    zone = string
+    cidr = string
+  }))
+  description = "Подсети сети: ключ — имя"
+
+  default = {
+    web-a = {
+      zone = "ru-central1-a"
+      cidr = "10.70.10.0/24"
+    }
+    web-b = {
+      zone = "ru-central1-b"
+      cidr = "10.70.20.0/24"
+    }
+    web-d = {
+      zone = "ru-central1-d"
+      cidr = "10.70.30.0/24"
+    }
+  }
+
+  validation {
+    condition     = length(var.subnets) >= 1
+    error_message = "Нужна хотя бы одна подсеть."
+  }
+}
+
+# Публичные порты веб-сервера и порт для SSH.
+variable "web_ports" {
+  type        = list(number)
+  description = "Порты, открытые для клиентов из интернета"
+  default     = [80]
+}
+
+variable "dns_zone" {
+  type        = string
+  description = "Доменная зона для записей (с точкой на конце)"
+  default     = "tf-course.example.com."
+
+  validation {
+    condition     = endswith(var.dns_zone, ".")
+    error_message = "Имя зоны указывается с точкой на конце: example.com."
+  }
+}
+
+variable "dns_record_name" {
+  type        = string
+  description = "Имя записи внутри зоны"
+  default     = "web"
+}
+
+variable "create_alb" {
+  type        = bool
+  description = "Создавать ли прикладной балансировщик (L7)"
+  default     = true
+}
+
+variable "enable_nat_gateway" {
+  type        = bool
+  description = "Создавать ли NAT-шлюз для выхода в интернет"
+  default     = true
+}
+EOF
+
+Код каждого файла проекта приведён в том разделе, где этот файл
+разбирается.
 
 ------------------------------------------------------------------
 1. ЗОНАЛЬНЫЕ И ГЛОБАЛЬНЫЕ РЕСУРСЫ
@@ -85,6 +391,102 @@
   10.70.20.0/24 и 10.70.30.0/24 — это три подсети внутри одного
   диапазона 10.70.0.0/16.
 
+Всё, что описано выше, лежит в одном файле network.tf: облачная
+сеть и подсети во всех трёх зонах. В нём же NAT-шлюз и таблица
+маршрутизации — о них следующий раздел.
+
+cat > network.tf <<'EOF'
+# Сеть, подсети в трёх зонах и выход в интернет.
+#
+# Разбираем три вещи, которые в учебных конфигурациях обычно
+# пропускают: зональность ресурсов, маршрутизацию и разницу между
+# «подсеть по умолчанию» и своей подсетью.
+
+resource "yandex_vpc_network" "this" {
+  name        = "${var.project_name}-net"
+  description = "Учебная сеть курса Terraform, практика 5"
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+# Подсети в разных зонах.
+#
+# Обратите внимание: одна сеть — много подсетей. Сеть глобальная
+# (не привязана к зоне), подсеть зональная. Машина может находиться
+# только в подсети своей зоны.
+resource "yandex_vpc_subnet" "this" {
+  for_each = var.subnets
+
+  name = "${var.project_name}-${each.key}"
+  zone = each.value.zone
+
+  network_id     = yandex_vpc_network.this.id
+  v4_cidr_blocks = [each.value.cidr]
+
+  # Таблица маршрутизации появится ниже; ссылка на неё нужна, чтобы
+  # машины без публичных адресов могли ходить в интернет.
+  route_table_id = var.enable_nat_gateway ? yandex_vpc_route_table.nat[0].id : null
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+    zone   = each.value.zone
+  }
+}
+
+# NAT-шлюз: выход в интернет для машин без публичных адресов.
+#
+# Подробно разобран в практике 4 — там без него не работала группа
+# машин. Здесь он нужен по той же причине: веб-серверы мы ставим
+# за балансировщик и публичных адресов им не выдаём.
+resource "yandex_vpc_gateway" "nat" {
+  count = var.enable_nat_gateway ? 1 : 0
+
+  name = "${var.project_name}-nat"
+  shared_egress_gateway {}
+}
+
+# Таблица маршрутизации: «весь трафик не в свою сеть — через шлюз».
+#
+# Таблица создаётся одна на сеть, а подключается к подсетям.
+# Если таблицу не подключить, шлюз не заработает: машины просто
+# не будут знать, куда отправлять пакеты наружу.
+resource "yandex_vpc_route_table" "nat" {
+  count = var.enable_nat_gateway ? 1 : 0
+
+  name       = "${var.project_name}-rt"
+  network_id = yandex_vpc_network.this.id
+
+  static_route {
+    destination_prefix = "0.0.0.0/0"
+    gateway_id         = yandex_vpc_gateway.nat[0].id
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+# ПРОВЕРКА ЗОНАЛЬНОСТИ
+#
+# Полезное наблюдение для самостоятельной работы: список зон облака
+# и список ваших подсетей — разные вещи. Посмотреть, какие зоны
+# доступны в облаке:
+#
+#   yc compute zone list
+#
+# А теперь сравните с тем, что создали мы: подсети есть в зонах a, b
+# и d, а зоны e и m остались без подсетей. Машину в зоне без подсети
+# создать нельзя — облако ответит ошибкой, что подсеть не найдена.
+#
+# Именно поэтому подсети создают заранее, по одной на каждую зону,
+# в которой планируется размещать ресурсы.
+EOF
+
 ------------------------------------------------------------------
 2. NAT-ШЛЮЗ И ТАБЛИЦА МАРШРУТИЗАЦИИ
 ------------------------------------------------------------------
@@ -122,6 +524,170 @@ NAT-шлюза и таблицы маршрутизации, а подсети �
 
 До этой практики мы пользовались группой безопасности, которую создал
 модуль. Теперь разберём, как их описывают всерьёз.
+
+Весь security.tf приведён здесь целиком, а дальше разобран
+по частям: так видно и связи между ресурсами, и то, как правило
+ссылается на другую группу. В файле три группы безопасности —
+web, internal и alb — и правила к ним.
+
+cat > security.tf <<'EOF'
+# Группы безопасности: правила отдельными ресурсами.
+#
+# Разбираем два подхода к описанию правил:
+#
+#  1. Вложенные блоки ingress/egress внутри группы безопасности.
+#     Компактно, но при изменении одного правила Terraform пересоздаёт
+#     блок целиком, и в истории изменений это выглядит как правка
+#     всей группы.
+#
+#  2. Отдельные ресурсы yandex_vpc_security_group_rule.
+#     Правила видны поштучно, их можно добавлять и удалять
+#     независимо, а в плане видно, какое именно правило меняется.
+#
+# Здесь используем второй подход: он ближе к рабочей практике.
+
+# Группа безопасности веб-серверов.
+resource "yandex_vpc_security_group" "web" {
+  name        = "${var.project_name}-web-sg"
+  description = "Доступ к веб-серверам из интернета"
+  network_id  = yandex_vpc_network.this.id
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+    role   = "web"
+  }
+}
+
+# Веб-порты из интернета.
+resource "yandex_vpc_security_group_rule" "web_public" {
+  for_each = toset([for p in var.web_ports : tostring(p)])
+
+  security_group_binding = yandex_vpc_security_group.web.id
+  direction              = "ingress"
+  description            = "Порт ${each.value} для клиентов"
+
+  protocol       = "TCP"
+  port           = tonumber(each.value)
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+# SSH. В учебной конфигурации открыт всем, в рабочей — только
+# адресам офиса или через бастион:
+#
+#   v4_cidr_blocks = ["203.0.113.10/32"]
+#
+# Оставлять 0.0.0.0/0 на 22-й порт в рабочей среде недопустимо:
+# перебор паролей и попытки подбора ключей начинаются в первые часы.
+resource "yandex_vpc_security_group_rule" "web_ssh" {
+  security_group_binding = yandex_vpc_security_group.web.id
+  direction              = "ingress"
+  description            = "SSH для администратора (на учебном стенде — отовсюду)"
+
+  protocol       = "TCP"
+  port           = 22
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+# Исходящий трафик: разрешён полностью (см. практику 4 — иначе
+# cloud-init не сможет установить пакеты).
+resource "yandex_vpc_security_group_rule" "web_egress" {
+  security_group_binding = yandex_vpc_security_group.web.id
+  direction              = "egress"
+  description            = "Исходящий трафик"
+
+  protocol       = "ANY"
+  from_port      = 0
+  to_port        = 65535
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+# Группа безопасности внутренних сервисов.
+#
+# Правило «откуда» задаётся не адресами, а ССЫЛКОЙ НА ДРУГУЮ ГРУППУ
+# БЕЗОПАСНОСТИ. Это важный приём: адреса в облаке меняются (машины
+# пересоздаются, подсети расширяются), а группы остаются.
+#
+# Так описывают доступ «приложение -> база данных», не перечисляя
+# адреса приложений.
+resource "yandex_vpc_security_group" "internal" {
+  name        = "${var.project_name}-internal-sg"
+  description = "Доступ к внутренним сервисам только с веб-серверов"
+  network_id  = yandex_vpc_network.this.id
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+    role   = "internal"
+  }
+}
+
+resource "yandex_vpc_security_group_rule" "internal_from_web" {
+  security_group_binding = yandex_vpc_security_group.internal.id
+  direction              = "ingress"
+  description            = "Трафик от машин группы web"
+
+  protocol = "TCP"
+  port     = 8080
+
+  # Источник — идентификатор другой группы безопасности.
+  security_group_id = yandex_vpc_security_group.web.id
+}
+
+resource "yandex_vpc_security_group_rule" "internal_egress" {
+  security_group_binding = yandex_vpc_security_group.internal.id
+  direction              = "egress"
+  description            = "Исходящий трафик"
+
+  protocol       = "ANY"
+  from_port      = 0
+  to_port        = 65535
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+# Группа безопасности прикладного балансировщика.
+#
+# Балансировщику нужна своя группа: он принимает клиентский трафик
+# из интернета и сам обращается к машинам за проверкой здоровья.
+resource "yandex_vpc_security_group" "alb" {
+  count = var.create_alb ? 1 : 0
+
+  name        = "${var.project_name}-alb-sg"
+  description = "Группа безопасности прикладного балансировщика"
+  network_id  = yandex_vpc_network.this.id
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+    role   = "alb"
+  }
+}
+
+resource "yandex_vpc_security_group_rule" "alb_public" {
+  for_each = var.create_alb ? toset(["80"]) : toset([])
+
+  security_group_binding = yandex_vpc_security_group.alb[0].id
+  direction              = "ingress"
+  description            = "HTTP от клиентов"
+
+  protocol       = "TCP"
+  port           = tonumber(each.value)
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+
+resource "yandex_vpc_security_group_rule" "alb_egress" {
+  count = var.create_alb ? 1 : 0
+
+  security_group_binding = yandex_vpc_security_group.alb[0].id
+  direction              = "egress"
+  description            = "Обращения к машинам и служебный трафик"
+
+  protocol       = "ANY"
+  from_port      = 0
+  to_port        = 65535
+  v4_cidr_blocks = ["0.0.0.0/0"]
+}
+EOF
 
 ДВА СПОСОБА ОПИСАНИЯ ПРАВИЛ
 
@@ -184,8 +750,8 @@ NAT-шлюза и таблицы маршрутизации, а подсети �
 
 ПРО ПОРТ 22
 
-  В учебной конфигурации SSH открыт всему интернету — иначе студенты
-  не смогут подключиться с произвольного адреса. В рабочей среде так
+  В учебной конфигурации SSH открыт всему интернету — иначе
+  подключиться с произвольного адреса не получится. В рабочей среде так
   делать нельзя: попытки подбора ключей начинаются в первые часы после
   появления машины с открытым 22-м портом. Правильно — ограничить
   адресами офиса или пускать через бастион:
@@ -256,6 +822,86 @@ NAT-шлюза и таблицы маршрутизации, а подсети �
 ------------------------------------------------------------------
 
 В Яндекс Облаке есть два вида зон, и это разделение нужно понимать.
+
+Весь dns.tf приведён здесь целиком, а дальше разобран по частям:
+в файле обе зоны и две записи в публичной зоне — служебная
+A-запись на закреплённый адрес и TXT для проверки, что зона
+отвечает.
+
+cat > dns.tf <<'EOF'
+# DNS в облаке: две зоны, и это не случайность.
+#
+#   ПУБЛИЧНАЯ зона (public = true) отвечает на запросы из интернета.
+#   Чтобы она действительно работала, домен нужно делегировать
+#   облаку: у регистратора прописать NS-серверы зоны. Пока делегации
+#   нет, зона существует, но интернет про неё не знает.
+#
+#   ПРИВАТНАЯ зона (public = false) видна только машинам указанных
+#   сетей. Так решают внутренние имена сервисов, не выходя в интернет.
+#
+# Важное следствие, на котором легко споткнуться: блок dns_record
+# в сетевом интерфейсе машины работает ТОЛЬКО с приватной зоной.
+# Попытка указать публичную заканчивается ошибкой:
+#
+#   Error: ... primary_v4_address_spec.dns_record_specs[0].dns_zone_id:
+#   DNS Zone (dns88v0...) has no private_visibility
+#
+# Логика понятна: запись создаётся для внутреннего адреса машины,
+# а внутренние адреса в публичном DNS не публикуют.
+
+# Публичная зона: внешние имена сервисов.
+resource "yandex_dns_zone" "public" {
+  name        = "${var.project_name}-public-zone"
+  description = "Публичная зона для внешних имён"
+  zone        = var.dns_zone
+  public      = true
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+# Приватная зона: внутренние имена машин.
+resource "yandex_dns_zone" "internal" {
+  name        = "${var.project_name}-internal-zone"
+  description = "Внутренняя зона для имён машин"
+  zone        = "${var.project_name}.internal."
+  public      = false
+
+  # Зона видна только машинам этой сети.
+  private_networks = [yandex_vpc_network.this.id]
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+# Публичная запись: имя сервиса указывает на закреплённый адрес.
+#
+# Запись создаётся ОТДЕЛЬНЫМ ресурсом, потому что адрес берётся
+# не у машины, а у статического адреса. Такую запись можно направить
+# на балансировщик, на несколько адресов сразу или на внешний сервис.
+resource "yandex_dns_recordset" "service" {
+  zone_id = yandex_dns_zone.public.id
+  name    = "service.${var.dns_zone}"
+  type    = "A"
+  ttl     = 300
+
+  data = [yandex_vpc_address.web.external_ipv4_address[0].address]
+}
+
+# Текстовая запись: удобна для проверки, что зона отвечает.
+resource "yandex_dns_recordset" "health" {
+  zone_id = yandex_dns_zone.public.id
+  name    = "health.${var.dns_zone}"
+  type    = "TXT"
+  ttl     = 60
+
+  data = ["ok:created-by-terraform"]
+}
+EOF
 
   ПУБЛИЧНАЯ ЗОНА (public = true) отвечает на запросы из интернета —
   но только после того, как домен делегирован облаку: у регистратора
@@ -354,6 +1000,8 @@ NAT-шлюза и таблицы маршрутизации, а подсети �
   curl -s -H "Metadata-Flavor: Google" \
     http://169.254.169.254/computeMetadata/v1/instance/
 
+  Ожидаемый ответ:
+
   attributes/
   description
   disks/
@@ -369,11 +1017,13 @@ NAT-шлюза и таблицы маршрутизации, а подсети �
   zone
 
 ВТОРОЕ: идентификатор подсети лежит в ключе с именем network. Ключа
-subnet-id не существует, и запрос по нему возвращает «Not Found» —
-мы получили это на живом стенде:
+subnet-id не существует, и запрос по нему возвращает «Not Found».
+Это проверено на живом стенде:
 
   curl -s -H "Metadata-Flavor: Google" \
     http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/
+
+  Ожидаемый ответ:
 
   access-configs/
   forwarded-ips/
@@ -394,6 +1044,170 @@ subnet-id не существует, и запрос по нему возвра�
 Ошибка в пути не ломает машину — просто в странице появится «Not Found»,
 и искать причину придётся долго.
 
+
+Начальная настройка машины живёт в отдельном файле, который
+передаётся облаку как user-data. Сначала создадим каталог для
+него:
+
+  mkdir -p cloud-init
+
+cat > cloud-init/web.yaml <<'EOF'
+#cloud-config
+# Начальная настройка веб-сервера.
+#
+# Формат и правила те же, что в практике 4: первая строка #cloud-config,
+# отступы только пробелами, файл читается один раз при первой загрузке,
+# ошибки видны только в журнале на самой машине.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Практика 5: сети</title>
+      </head>
+      <body>
+        <h1>Веб-сервер за прикладным балансировщиком</h1>
+        <p>Адреса подставлены скриптом cloud-init из службы метаданных.</p>
+      </body>
+      </html>
+
+runcmd:
+  # Адреса берём из службы метаданных Яндекс Облака.
+  # Заголовок Metadata-Flavor: Google обязателен, а путь отличается
+  # от пути в AWS (подробно — в практике 4).
+  - |
+    META=http://169.254.169.254/computeMetadata/v1/instance
+
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/access-configs/0/external-ip")
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/ip")
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" "$META/hostname")
+    ZONE=$(curl -s -H "Metadata-Flavor: Google" "$META/zone")
+
+    # ВНИМАНИЕ: идентификатор подсети лежит в ключе с именем network.
+    # Ключа subnet-id в службе метаданных нет, и запрос по нему
+    # возвращает «Not Found» — мы это проверили на живом стенде.
+    #
+    # Посмотреть, какие ключи есть на самом деле, можно так:
+    #   curl -s -H "Metadata-Flavor: Google" \
+    #     http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/
+    SUBNET=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/network")
+
+    {
+      printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP"
+      printf '<p>Внутренний адрес: %s</p>\n' "$INTERNAL_IP"
+      printf '<p>Имя машины: %s</p>\n' "$HOSTNAME"
+      printf '<p>Зона доступности: %s</p>\n' "${ZONE##*/}"
+      printf '<p>Подсеть: %s</p>\n' "$SUBNET"
+    } >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx
+
+final_message: "Веб-сервер готов за $UPTIME секунд"
+EOF
+
+А вот сама машина: она читает этот файл, закрепляет за собой
+статический адрес и заводит внутреннюю запись в приватной зоне
+DNS.
+
+cat > web-vm.tf <<'EOF'
+# Веб-сервер со статическим адресом и записью в DNS.
+#
+# Машина одна, но описана так, как описывают машины за балансировщиком:
+# группа безопасности своя, адрес закреплён, имя в DNS есть.
+
+data "yandex_compute_image" "os" {
+  family = var.image_family
+}
+
+resource "yandex_compute_instance" "web" {
+  name        = "${var.project_name}-web"
+  description = "Веб-сервер со статическим адресом"
+
+  # Зона машины должна совпадать с зоной подсети — иначе облако
+  # откажет в создании (эту ошибку мы разбирали в практике 3).
+  zone        = var.zone
+  platform_id = "standard-v3"
+
+  allow_stopping_for_update = true
+
+  resources {
+    cores         = 2
+    memory        = 2
+    core_fraction = 20
+  }
+
+  scheduling_policy {
+    preemptible = true
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.os.id
+      type     = "network-hdd"
+      size     = 10
+    }
+  }
+
+  network_interface {
+    # Подсеть той же зоны, что и машина.
+    subnet_id = yandex_vpc_subnet.this["web-d"].id
+
+    nat = true
+
+    # Вот он, статический адрес: вместо автоматически выданного
+    # используем закреплённый за нами.
+    nat_ip_address = yandex_vpc_address.web.external_ipv4_address[0].address
+
+    security_group_ids = [yandex_vpc_security_group.web.id]
+
+    # Внутренняя запись DNS создаётся прямо здесь: облако заведёт
+    # A-запись с внутренним адресом машины в ПРИВАТНОЙ зоне.
+    #
+    # С публичной зоной этот блок не работает — облако отвечает
+    # «DNS Zone has no private_visibility»: внутренние адреса машины
+    # в публичном DNS не публикуют. Публичные имена мы заводим
+    # отдельными ресурсами yandex_dns_recordset (см. dns.tf).
+    dns_record {
+      fqdn        = "${var.project_name}-web.${yandex_dns_zone.internal.zone}"
+      dns_zone_id = yandex_dns_zone.internal.id
+      ttl         = 300
+
+      # ptr = false обязателен для приватной зоны. Обратная запись
+      # (PTR) для приватных зон в Яндекс Облаке не поддерживается:
+      #
+      #   Auto PTR records are currently not supported for private
+      #   DNS Zones, but got a private-only DNS Zone
+      ptr = false
+    }
+  }
+
+  metadata = {
+    ssh-keys  = "ubuntu:${file(var.ssh_public_key)}"
+    user-data = file("${path.module}/cloud-init/web.yaml")
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+    role   = "web"
+  }
+}
+EOF
 
 ========================================================================
 ЧАСТЬ 2. ПРОДОЛЖЕНИЕ: ПРИКЛАДНОЙ БАЛАНСИРОВЩИК
@@ -422,6 +1236,181 @@ HTTP-обвязки) или когда нужна минимальная зад�
 ------------------------------------------------------------------
 
 Пять ресурсов, и их постоянно путают. Разберём по порядку.
+
+Весь alb.tf приведён здесь целиком, а дальше разобран по частям:
+так видно и связи между ресурсами, и то, что создаются они только
+при create_alb = true. Обратите внимание на count у каждого
+ресурса — именно он делает балансировщик необязательным.
+
+cat > alb.tf <<'EOF'
+# Прикладной балансировщик (Application Load Balancer, L7).
+#
+# Чем отличается от сетевого (NLB) из практики 4:
+#
+#   NLB работает на четвёртом уровне: распределяет TCP-соединения,
+#   ничего не знает про HTTP, не умеет маршрутизировать по путям
+#   и заголовкам.
+#
+#   ALB работает на седьмом уровне: понимает HTTP, умеет отправлять
+#   разные запросы на разные группы бэкендов (маршрутизация по пути
+#   и по имени хоста), терминировать HTTPS, добавлять и менять
+#   заголовки, ограничивать скорость запросов.
+#
+# Из чего состоит ALB в Terraform — четыре ресурса, и это важно
+# запомнить, потому что их часто путают:
+#
+#   yandex_alb_target_group    кто принимает трафик (машины и их адреса)
+#   yandex_alb_backend_group   как обращаться к машинам и как их проверять
+#   yandex_alb_http_router     правила маршрутизации (роутер)
+#   yandex_alb_virtual_host    привязка правил и бэкендов (виртуальный хост)
+#
+# Плюс сам yandex_alb_load_balancer: слушатели, зоны и группы
+# безопасности.
+
+resource "yandex_alb_target_group" "web" {
+  count = var.create_alb ? 1 : 0
+
+  name = "${var.project_name}-alb-tg"
+
+  target {
+    # Цель — наша машина. Адрес внутренний: балансировщик общается
+    # с бэкендами внутри облака, наружу смотрит только он сам.
+    ip_address = yandex_compute_instance.web.network_interface[0].ip_address
+    subnet_id  = yandex_compute_instance.web.network_interface[0].subnet_id
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+resource "yandex_alb_backend_group" "web" {
+  count = var.create_alb ? 1 : 0
+
+  name = "${var.project_name}-alb-bg"
+
+  http_backend {
+    name = "web-backend"
+
+    weight = 1
+    port   = 80
+
+    target_group_ids = [yandex_alb_target_group.web[0].id]
+
+    # Проверка здоровья на стороне балансировщика. Интервалы
+    # задаются строками с единицами измерения: "2s", "500ms".
+    healthcheck {
+      timeout  = "1s"
+      interval = "2s"
+
+      healthy_threshold   = 2
+      unhealthy_threshold = 2
+
+      http_healthcheck {
+        path = "/"
+      }
+    }
+  }
+}
+
+resource "yandex_alb_http_router" "web" {
+  count = var.create_alb ? 1 : 0
+
+  name = "${var.project_name}-alb-router"
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+
+resource "yandex_alb_virtual_host" "web" {
+  count = var.create_alb ? 1 : 0
+
+  name           = "${var.project_name}-alb-vh"
+  http_router_id = yandex_alb_http_router.web[0].id
+
+  # По каким именам хоста отвечает этот виртуальный хост.
+  # Пустой список означает «любое имя».
+  authority = ["*"]
+
+  route {
+    name = "main"
+
+    http_route {
+      http_route_action {
+        backend_group_id = yandex_alb_backend_group.web[0].id
+      }
+    }
+  }
+}
+
+resource "yandex_alb_load_balancer" "web" {
+  count = var.create_alb ? 1 : 0
+
+  name = "${var.project_name}-alb"
+
+  network_id = yandex_vpc_network.this.id
+
+  security_group_ids = [yandex_vpc_security_group.alb[0].id]
+
+  # Где размещается балансировщик. Каждый узел живёт в своей подсети,
+  # поэтому для отказоустойчивости перечисляют несколько зон со своими
+  # подсетями.
+  allocation_policy {
+    location {
+      zone_id   = var.zone
+      subnet_id = yandex_vpc_subnet.this["web-d"].id
+    }
+  }
+
+  # Слушатель: что и на каком порту принимает балансировщик.
+  listener {
+    name = "http"
+
+    endpoint {
+      # Тип адреса надо указать явно. Пустой блок address {}
+      # облако не принимает:
+      #
+      #   Error: Either external ipv4 address or internal ipv4 address
+      #   or external ipv6 address should be specified
+      #
+      # Пустой вложенный блок external_ipv4_address означает «выдай
+      # публичный адрес сам». Тот же приём работает и с закреплённым
+      # адресом:
+      #
+      #   external_ipv4_address {
+      #     address = yandex_vpc_address.alb.external_ipv4_address[0].address
+      #   }
+      address {
+        external_ipv4_address {}
+      }
+
+      ports = [80]
+    }
+
+    # Обработка HTTP поручена HTTP-роутеру: именно он решает,
+    # на какую группу бэкендов отправить запрос.
+    http {
+      handler {
+        http_router_id = yandex_alb_http_router.web[0].id
+
+        # Здесь же настраивают редирект с HTTP на HTTPS и
+        # терминирование TLS сертификатом из Certificate Manager:
+        #
+        #   redirect_http_to_https = true
+        #   certificate_id = yandex_cm_certificate.this.id
+      }
+    }
+  }
+
+  labels = {
+    course = "terraform"
+    lesson = "5"
+  }
+}
+EOF
 
   ЦЕЛЕВАЯ ГРУППА — кто принимает трафик:
 
@@ -543,8 +1532,8 @@ HTTP-обвязки) или когда нужна минимальная зад�
       yandex_alb_load_balancer.web[0]: Still creating... [06m30s elapsed]
       yandex_alb_load_balancer.web[0]: Creation complete after 6m45s
 
-    Почти семь минут. На занятии это надо учитывать: создавайте ALB
-    заранее или занимайте группу разбором конфигурации, пока он
+    Почти семь минут. Это надо учитывать заранее: создавайте ALB
+    до начала проверок или разбирайте конфигурацию, пока он
     создаётся. Удаляется он тоже не мгновенно.
 
 ------------------------------------------------------------------
@@ -583,6 +1572,93 @@ HTTP-обвязки) или когда нужна минимальная зад�
 
 Обратите внимание: правила отображаются так, как их понимает облако,
 включая автоматически добавленные правила по умолчанию.
+
+Выводы, по которым делаются все эти проверки, собраны в файле
+outputs.tf. Обратите внимание на try() вокруг адреса балансировщика
+и на проверку на null в команде для ALB: пока балансировщик
+не создан, подставлять null в строку Terraform не разрешает.
+
+cat > outputs.tf <<'EOF'
+output "web_static_ip" {
+  description = "Закреплённый публичный адрес веб-сервера"
+  value       = yandex_vpc_address.web.external_ipv4_address[0].address
+}
+
+output "web_private_ip" {
+  description = "Внутренний адрес веб-сервера"
+  value       = yandex_compute_instance.web.network_interface[0].ip_address
+}
+
+output "web_zone" {
+  description = "Зона веб-сервера"
+  value       = yandex_compute_instance.web.zone
+}
+
+output "subnet_ids" {
+  description = "Идентификаторы подсетей: ключ — имя подсети"
+  value       = { for name, s in yandex_vpc_subnet.this : name => s.id }
+}
+
+output "zones_covered" {
+  description = "Какие зоны покрыты подсетями"
+  value       = keys(local.zone_to_subnet)
+}
+
+output "security_groups" {
+  description = "Группы безопасности: имя — идентификатор"
+  value = {
+    web      = yandex_vpc_security_group.web.id
+    internal = yandex_vpc_security_group.internal.id
+    alb      = var.create_alb ? yandex_vpc_security_group.alb[0].id : null
+  }
+}
+
+output "dns_zones" {
+  description = "DNS-зоны: публичная и приватная"
+  value = {
+    public   = { id = yandex_dns_zone.public.id, zone = yandex_dns_zone.public.zone }
+    internal = { id = yandex_dns_zone.internal.id, zone = yandex_dns_zone.internal.zone }
+  }
+}
+
+output "dns_records" {
+  description = "Записи, созданные в публичной зоне"
+  value = {
+    service = yandex_dns_recordset.service.name
+    health  = yandex_dns_recordset.health.name
+  }
+}
+
+output "internal_dns_name" {
+  description = "Внутреннее имя машины (создаётся в приватной зоне)"
+  value       = yandex_compute_instance.web.network_interface[0].dns_record[0].fqdn
+}
+
+output "alb_ip" {
+  description = "Публичный адрес прикладного балансировщика"
+  value       = local.alb_address
+}
+
+output "check_commands" {
+  description = "Готовые команды для проверки"
+  value = {
+    via_static_ip = "curl -s http://${yandex_vpc_address.web.external_ipv4_address[0].address}/"
+
+    # Проверка на null обязательна: пока балансировщик не создан,
+    # адреса нет, а подставлять null в строку Terraform не разрешает:
+    #
+    #   Error: Invalid template interpolation value
+    #   The expression result is null.
+    #   Cannot include a null value in a string template.
+    via_alb = local.alb_address == null ? (
+      "балансировщик не создавался (или адрес ещё неизвестен)"
+    ) : "curl -s http://${local.alb_address}/"
+
+    dns_query = "yc dns zone list-records --id ${yandex_dns_zone.public.id}"
+    sg_rules  = "yc vpc security-group list-rules ${yandex_vpc_security_group.web.id}"
+  }
+}
+EOF
 
 ------------------------------------------------------------------
 10. HTTPS И СЕРТИФИКАТ: ЧТО НУЖНО ДОБАВИТЬ

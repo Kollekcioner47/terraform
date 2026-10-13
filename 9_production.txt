@@ -1,0 +1,1796 @@
+ПРАКТИКА 9. ПРОМЫШЛЕННАЯ ЭКСПЛУАТАЦИЯ: ОКРУЖЕНИЯ, КОНВЕЙЕР, ТЕСТЫ
+
+Продолжительность: 2 академических часа.
+Провайдер: yandex-cloud/yandex. Практика выполняется в Яндекс Облаке.
+
+ЧТО БУДЕТ К КОНЦУ ПРАКТИКИ
+
+  Вы разделите один и тот же код на два окружения с независимыми
+  состояниями, научитесь проверять конфигурацию тестами без обращения
+  к облаку, настроите фиксацию версии провайдера для разных платформ
+  и соберёте конвейер, который считает план на каждый merge request,
+  а применяет — только вручную и только из основной ветки. В конце
+  развернёте итоговый стенд курса одной командой и так же его снесёте.
+
+ЧТО НУЖНО ЗАРАНЕЕ
+
+  * Все предыдущие практики: доступ, состояние, модули, машины,
+    сети, данные и секреты, Kubernetes.
+  * Репозиторий с курсом (или свой) и понимание, что такое
+    merge request.
+  * Сервисный аккаунт с ролью storage.editor — состояние живёт в бакете.
+
+ГДЕ ЭТО МОЖНО ПРИМЕНИТЬ НА ПРАКТИКЕ
+
+  Навыки этой практики не проверяются «в облаке» — они проверяются
+  в работе: именно они отличают человека, который умеет запускать
+  terraform apply, от человека, которому можно доверить инфраструктуру
+  в общем окружении.
+
+
+========================================================================
+ЧАСТЬ 1. БАЗОВАЯ
+========================================================================
+
+------------------------------------------------------------------
+0. КАТАЛОГ ПРОЕКТА И ФАЙЛЫ
+------------------------------------------------------------------
+
+Правило, которое нарушают чаще всего: ОДИН ПРОЕКТ — ОДИН
+КАТАЛОГ. Terraform работает с состоянием в пределах каталога,
+поэтому файлы разных проектов в одной папке перемешают ресурсы
+и состояние.
+
+Создаём каталог практики:
+
+  mkdir -p ~/terraform-course/work/09-production
+  cd ~/terraform-course/work/09-production
+
+Здесь ~/terraform-course — клон репозитория с материалами курса.
+Каталог work/ внутрь репозитория не попадает: он перечислен
+в .gitignore, чтобы ваши эксперименты не смешивались
+с материалами курса.
+
+СТРУКТУРА ПРОЕКТА
+
+  09-production/
+  ├── app.tf
+  ├── ci/
+  │   ├── github-actions.yml
+  │   └── gitlab-ci.yml
+  ├── cloud-init/
+  │   └── app.yaml
+  ├── env/
+  │   ├── backend-dev.tfvars.example
+  │   ├── backend-prod.tfvars.example
+  │   ├── dev.tfvars.example
+  │   └── prod.tfvars.example
+  ├── outputs.tf
+  ├── provider.tf
+  ├── site/
+  │   └── index.html
+  ├── site.tf
+  ├── tests/
+  │   └── basics.tftest.hcl
+  ├── variables.tf
+  └── versions.tf
+
+  ../modules/vpc/          общий модуль сети (создан в практике 3)
+    ├── main.tf
+    ├── outputs.tf
+    ├── variables.tf
+    └── versions.tf
+
+  Плюс файлы, которые создаются при работе и в репозиторий
+  не попадают: terraform.tfvars (значения переменных),
+  terraform.tfstate (состояние), .terraform/ (провайдеры).
+  Файл .terraform.lock.hcl, наоборот, нужно сохранить в git:
+  он фиксирует версии провайдеров.
+
+КАК СОЗДАЁМ ФАЙЛЫ
+
+  Файлы можно набрать по тексту практики. Конструкция
+  cat > имя-файла <<'EOF' записывает в файл всё, что введено до
+  строки EOF, поэтому такой блок можно скопировать в терминал
+  целиком. Строки cat и EOF стоят в первом столбце: отступ сломал
+  бы завершение ввода.
+
+  Готовые файлы практики лежат в материалах курса — их можно
+  взять вместо набора по тексту:
+
+  cp -r ~/terraform-course/files/09_production/. .
+  mkdir -p ../modules
+  cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+  Вторая команда копирует общий модуль сети: в конфигурациях он
+  подключается как source = "../modules/vpc", то есть лежит рядом
+  с каталогом практики, в каталоге work/modules/vpc. Без модуля
+  terraform init остановится с ошибкой:
+
+    Error: Unreadable module directory
+    Error: Module not installed
+
+
+Файл переменных описывает входные значения стенда: идентификаторы
+облака и каталога, пути к ключам, размеры машины, имя бакета
+и защиту ресурсов. Окружение и имя бакета проверяются условиями
+validation.
+
+cat > variables.tf <<'EOF'
+variable "cloud_id" {
+  type        = string
+  description = "Идентификатор облака"
+}
+
+variable "folder_id" {
+  type        = string
+  description = "Идентификатор каталога"
+}
+
+variable "zone" {
+  type        = string
+  description = "Зона доступности"
+  default     = "ru-central1-d"
+}
+
+variable "sa_key_file" {
+  type        = string
+  description = "Путь к авторизованному ключу сервисного аккаунта"
+}
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Путь к публичному SSH-ключу"
+}
+
+variable "storage_access_key" {
+  type        = string
+  description = "Идентификатор статического ключа доступа"
+  default     = null
+  sensitive   = true
+}
+
+variable "storage_secret_key" {
+  type        = string
+  description = "Секретная часть статического ключа доступа"
+  default     = null
+  sensitive   = true
+}
+
+# ОКРУЖЕНИЕ. Именно этот параметр отличает dev от prod: он попадает
+# в имена ресурсов, в метки и в размеры машин.
+variable "environment" {
+  type        = string
+  description = "Окружение: dev или prod"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "Окружение: dev или prod."
+  }
+}
+
+variable "project_name" {
+  type        = string
+  description = "Префикс в именах ресурсов"
+  default     = "tf-final"
+}
+
+variable "image_family" {
+  type        = string
+  description = "Семейство образов"
+  default     = "ubuntu-2604-lts"
+}
+
+# Создавать ли приложение. В dev достаточно сети и бакета,
+# в prod — полный набор. Это не «экономия ради экономии»:
+# окружения действительно отличаются составом ресурсов.
+variable "create_app" {
+  type        = bool
+  description = "Создавать ли виртуальную машину приложения"
+  default     = true
+}
+
+variable "app_cores" {
+  type        = number
+  description = "Ядра машины приложения"
+  default     = 2
+}
+
+variable "app_memory" {
+  type        = number
+  description = "Память машины, ГБ"
+  default     = 2
+}
+
+variable "preemptible" {
+  type        = bool
+  description = "Прерываемая ли машина (в dev — да, в prod — нет)"
+  default     = true
+}
+
+variable "site_bucket" {
+  type        = string
+  description = "Имя бакета сайта (уникально во всём Object Storage)"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.site_bucket))
+    error_message = "Имя бакета: строчные латинские буквы, цифры, точка и дефис."
+  }
+}
+
+# Защита ресурсов от удаления. В prod включается, в dev выключается:
+# иначе учебный стенд не удалить одной командой.
+variable "protect_resources" {
+  type        = bool
+  description = "Защищать ли ресурсы от случайного удаления"
+  default     = false
+}
+EOF
+
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.3"
+
+  required_providers {
+    yandex = {
+      source  = "yandex-cloud/yandex"
+      version = "~> 0.229.0"
+    }
+  }
+
+  # Хранилище состояния. Ключ (key) и имя бакета НЕ указаны здесь
+  # намеренно: они передаются при инициализации и отличаются для
+  # окружений. Так одна и та же конфигурация обслуживает и dev, и prod,
+  # а состояния у них разные:
+  #
+  #   terraform init -backend-config=env/backend-dev.tfvars
+  #   terraform init -backend-config=env/backend-prod.tfvars
+  #
+  # Альтернатива — отдельные каталоги на окружение. Она нагляднее,
+  # но приводит к копированию конфигурации. Про выбор — в тексте.
+  backend "s3" {
+    endpoints = {
+      s3 = "https://storage.yandexcloud.net"
+    }
+
+    region = "ru-central1"
+
+    use_lockfile = true
+
+    skip_region_validation      = true
+    skip_credentials_validation = true
+    skip_requesting_account_id  = true
+    skip_s3_checksum            = true
+  }
+}
+EOF
+
+cat > provider.tf <<'EOF'
+provider "yandex" {
+  cloud_id                 = var.cloud_id
+  folder_id                = var.folder_id
+  zone                     = var.zone
+  service_account_key_file = var.sa_key_file
+
+  storage_access_key = var.storage_access_key
+  storage_secret_key = var.storage_secret_key
+}
+EOF
+
+cat > site.tf <<'EOF'
+# Бакет для статического сайта: то, что в курсе называлось
+# «статический сайт в Object Storage».
+#
+# В этой практике нас интересует не сам сайт, а то, как такие ресурсы
+# переживают смену окружения: имя бакета включает окружение, иначе
+# стенды dev и prod подерутся за одно и то же имя (имена бакетов
+# уникальны во всём Object Storage).
+
+resource "yandex_storage_bucket" "site" {
+  bucket = var.site_bucket
+
+  anonymous_access_flags {
+    read = true
+    list = true
+  }
+
+  versioning {
+    enabled = true
+  }
+
+  website {
+    index_document = "index.html"
+    error_document = "error.html"
+  }
+
+  force_destroy = true
+
+  tags = local.common_labels
+}
+
+resource "yandex_storage_object" "index" {
+  bucket = yandex_storage_bucket.site.id
+  key    = "index.html"
+
+  content_base64 = base64encode(templatefile(
+    "${path.module}/site/index.html",
+    { environment = var.environment }
+  ))
+  content_type = "text/html; charset=utf-8"
+}
+EOF
+
+cat > env/dev.tfvars.example <<'EOF'
+# Значения переменных для окружения DEV.
+#
+# Передаётся при запуске:
+#   terraform apply -var-file=env/dev.tfvars
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-d"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+storage_access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+storage_secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+
+environment  = "dev"
+project_name = "tf-final"
+
+# В dev: машина прерываемая, экономная, защита выключена.
+create_app   = true
+app_cores    = 2
+app_memory   = 2
+preemptible  = true
+
+# Имя бакета уникально во всём Object Storage — добавьте своё.
+site_bucket = "tf-final-dev-site-ivan"
+
+protect_resources = false
+EOF
+
+cat > env/prod.tfvars.example <<'EOF'
+# Значения переменных для окружения PROD.
+#
+# Передаётся при запуске:
+#   terraform apply -var-file=env/prod.tfvars
+
+cloud_id       = "b1gXXXXXXXXXXXXXXX"
+folder_id      = "b1gYYYYYYYYYYYYYYY"
+zone           = "ru-central1-a"
+sa_key_file    = "/home/user/.yc/tf-course-key.json"
+ssh_public_key = "~/.ssh/id_ed25519.pub"
+
+storage_access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+storage_secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+
+environment  = "prod"
+project_name = "tf-final"
+
+# В prod: машина обычная (не прерываемая), ядер и памяти больше,
+# защита ресурсов включена.
+create_app   = true
+app_cores    = 4
+app_memory   = 4
+preemptible  = false
+
+site_bucket = "tf-final-prod-site-ivan"
+
+protect_resources = true
+EOF
+
+cat > env/backend-dev.tfvars.example <<'EOF'
+# Настройки хранилища состояния для окружения DEV.
+#
+# Передаются при инициализации:
+#   terraform init -backend-config=env/backend-dev.tfvars
+
+bucket = "tf-course-state-ivan"
+
+# Ключ состояния включает окружение. Именно это делает состояния
+# независимыми: изменения в dev не видят ресурсы prod и наоборот.
+key = "final/dev/terraform.tfstate"
+
+access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+EOF
+
+cat > env/backend-prod.tfvars.example <<'EOF'
+# Настройки хранилища состояния для окружения PROD.
+#
+# Передаются при инициализации:
+#   terraform init -backend-config=env/backend-prod.tfvars
+#
+# ВАЖНО: если у вас несколько окружений, для prod обычно берут
+# ОТДЕЛЬНЫЙ бакет и ОТДЕЛЬНЫЙ сервисный аккаунт с правами только
+# на него. Тогда ошибка в конвейере dev не сможет испортить prod.
+
+bucket = "tf-course-state-prod"
+
+key = "final/prod/terraform.tfstate"
+
+access_key = "YCAJEXXXXXXXXXXXXXXXXXX"
+secret_key = "СЕКРЕТНАЯ_ЧАСТЬ_КЛЮЧА"
+EOF
+
+МОДУЛЬ СЕТИ ВРУЧНУЮ
+
+Модуль сети создан в практике 3 и используется всеми последующими
+практиками, кроме практики 7: реестру, функции и шлюзу API сеть
+не нужна. Если вы копировали готовые файлы, он уже на месте.
+Если создаёте всё сами — создайте и модуль:
+
+  mkdir -p ../modules/vpc
+
+Содержимое четырёх файлов модуля приведено в практике 3, в разделе
+«МОДУЛЬ СЕТИ ЦЕЛИКОМ», или возьмите готовые:
+
+  cp -r ~/terraform-course/files/modules/vpc ../modules/
+
+Код каждого файла проекта приведён в том разделе, где этот
+файл разбирается.
+
+------------------------------------------------------------------
+1. ДВА ОКРУЖЕНИЯ ИЗ ОДНОГО КОДА
+------------------------------------------------------------------
+
+Задача: один и тот же код должен разворачивать и dev, и prod, причём
+изменения в одном окружении не должны задевать второе.
+
+Есть два подхода, и оба рабочие.
+
+  ПОДХОД 1: ОТДЕЛЬНЫЙ КАТАЛОГ НА ОКРУЖЕНИЕ
+
+    environments/
+      dev/    backend.tf, main.tf, terraform.tfvars
+      prod/   backend.tf, main.tf, terraform.tfvars
+
+  Состояния независимы по построению: у каждого каталога свой файл
+  состояния. Минус — копирование конфигурации: два файла, которые
+  должны оставаться одинаковыми, но живут отдельно.
+
+  ПОДХОД 2: ОДИН КОД, РАЗНЫЕ ЗНАЧЕНИЯ И РАЗНЫЕ КЛЮЧИ СОСТОЯНИЯ
+
+  Конфигурация одна, а отличаются две вещи:
+
+    ключ состояния      — какой объект в бакете читать;
+    файл значений       — какие значения у переменных.
+
+  В курсе используется второй подход, потому что он нагляднее
+  показывает суть: ОКРУЖЕНИЕ — ЭТО НЕ КОПИЯ КОДА, А ДРУГОЕ СОСТОЯНИЕ
+  И ДРУГИЕ ЗНАЧЕНИЯ.
+
+Настройки хранилища вынесены в отдельные файлы:
+
+  # env/backend-dev.tfvars
+  bucket = "tf-course-state-ivan"
+  key    = "final/dev/terraform.tfstate"
+
+  # env/backend-prod.tfvars
+  bucket = "tf-course-state-prod"
+  key    = "final/prod/terraform.tfstate"
+
+Инициализация и работа:
+
+  terraform init -backend-config=env/backend-dev.tfvars
+  terraform apply -var-file=env/dev.tfvars
+
+  terraform init -backend-config=env/backend-prod.tfvars -reconfigure
+  terraform apply -var-file=env/prod.tfvars
+
+  Ключ -reconfigure нужен потому, что настройки хранилища изменились:
+  без него Terraform предложит перенести состояние
+  (init -migrate-state), а нам это не нужно — состояния разные.
+
+ОЖИДАЕМЫЙ РЕЗУЛЬТАТ
+
+  В бакете появились два независимых состояния:
+
+    yc storage s3api list-objects --bucket tf-course-state-r8-2026
+    - key: final/dev/terraform.tfstate
+    - key: final/prod/terraform.tfstate
+
+  После этого можно переключаться между окружениями и убедиться,
+  что в плане видны только ресурсы текущего окружения.
+
+ЧЕГО НЕ ДЕЛАТЬ: WORKSPACES
+
+  У Terraform есть механизм workspaces — несколько состояний
+  в одном каталоге. Для разделения окружений он не подходит,
+  и вот почему:
+
+    * окружения оказываются «спрятаны» внутри одного состояния:
+      нельзя дать разработчику доступ к dev, но не к prod;
+    * нельзя задать разные бэкенды, разные версии провайдера
+      и разные наборы переменных;
+    * забыл переключить workspace — применил не туда. Ошибка
+      тихая: terraform apply просто сработает в другом окружении.
+
+  Workspaces годятся для временных копий: «сделать стенд на время
+  эксперимента и удалить». Для dev и prod — отдельные состояния
+  в отдельных ключах или бакетах.
+
+И ЧТО ЕЩЁ ВАЖНО: ИМЕНА РЕСУРСОВ
+
+  Типичная ошибка при столкновении окружений:
+
+    Error: Error while requesting API to create subnet:
+    code = AlreadyExists desc = Subnet with name app already exists
+
+  Причина: модуль сети называл подсеть просто по ключу словаря —
+  «app». Два окружения в одном каталоге столкнулись по имени.
+
+  Лечится это на уровне модуля:
+
+    resource "yandex_vpc_subnet" "this" {
+      for_each = var.subnets
+
+      name = "${var.network_name}-${each.key}"
+    }
+
+  Правило: если ресурс может существовать в двух окружениях
+  в одном каталоге, имя должно включать окружение. Иначе рано
+  или поздно окружения столкнутся.
+
+------------------------------------------------------------------
+2. ТЕСТЫ КОНФИГУРАЦИИ: TERRAFORM TEST
+------------------------------------------------------------------
+
+Terraform 1.6 добавил встроенный механизм проверки конфигурации.
+Тест описывает, что должно получиться, а Terraform проверяет условия.
+
+Файл тестов лежит в отдельном каталоге tests/. Он самодостаточен:
+значения переменных заданы внутри, провайдер замокирован, поэтому
+обращений к облаку не происходит.
+
+  mkdir -p tests
+
+cat > tests/basics.tftest.hcl <<'EOF'
+# Тесты конфигурации.
+#
+# Запуск:
+#
+#   terraform test
+#   terraform test -verbose
+#   terraform test -filter=tests/basics.tftest.hcl
+#
+# Что такое terraform test: это встроенный в Terraform механизм
+# проверки конфигурации (Terraform 1.6 и новее). Тест описывает,
+# ЧТО должно получиться, а Terraform проверяет это условиями assert.
+#
+# Два вида проверки:
+#   command = plan   — проверяем план, ничего не создавая.
+#                      Быстро, безопасно, годится для конвейера.
+#   command = apply  — создаём реальные ресурсы, проверяем, удаляем.
+#                      Медленнее, требует облака; нужен для проверок,
+#                      которые видны только после создания.
+#
+# ПРОВАЙДЕР МОЖНО ЗАМОКИРОВАТЬ (mock_provider): тогда Terraform
+# не обращается к облаку вообще, а подставляет выдуманные значения.
+# Это позволяет запускать тесты в конвейере без ключей и без денег.
+#
+# Значения переменных задаются в блоке variables: тест должен быть
+# самодостаточным, terraform.tfvars в нём не участвует.
+
+variables {
+  cloud_id       = "b1gtest0000000000000"
+  folder_id      = "b1gtest0000000000001"
+  zone           = "ru-central1-d"
+  sa_key_file    = "/tmp/test-key.json"
+  ssh_public_key = "/tmp/test-key.pub"
+  environment    = "dev"
+  project_name   = "tf-test"
+  site_bucket    = "tf-test-bucket-000"
+
+  # В тестах не создаём машину: проверяем описание, а не облако.
+  create_app = false
+}
+
+# Заглушка провайдера: обращения к облаку не происходят.
+mock_provider "yandex" {}
+
+# ------------------------------------------------------------------
+# Проверки
+# ------------------------------------------------------------------
+
+run "network_is_created" {
+  command = plan
+
+  assert {
+    condition     = module.vpc.subnet_count == 1
+    error_message = "Модуль сети должен создать ровно одну подсеть."
+  }
+
+  assert {
+    condition     = length(module.vpc.subnet_ids) == 1
+    error_message = "Ожидалась одна подсеть в словаре subnet_ids."
+  }
+}
+
+run "names_include_environment" {
+  command = plan
+
+  # Имена ресурсов обязаны содержать окружение: иначе стенды
+  # dev и prod невозможно различить в облаке.
+  assert {
+    condition     = local.name_prefix == "tf-test-dev"
+    error_message = "Префикс имени должен включать имя проекта и окружение."
+  }
+}
+
+run "bucket_name_is_valid" {
+  command = plan
+
+  assert {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.site_bucket))
+    error_message = "Имя бакета не соответствует правилам Object Storage."
+  }
+}
+
+run "production_gets_more_resources" {
+  command = plan
+
+  variables {
+    environment = "prod"
+  }
+
+  # В prod машина «полноценная», в dev — экономная. Проверяем
+  # именно логику выбора, а не конкретные числа.
+  assert {
+    condition     = local.app_cores == 4 && local.app_memory == 4
+    error_message = "В prod машина должна быть из 4 ядер и 4 ГБ."
+  }
+
+  assert {
+    condition     = local.name_prefix == "tf-test-prod"
+    error_message = "Префикс имени должен смениться вместе с окружением."
+  }
+}
+
+run "dev_is_not_bigger_than_prod" {
+  command = plan
+
+  assert {
+    condition     = local.app_cores <= 4 && local.app_memory <= 4
+    error_message = "В dev машина не должна быть больше, чем в prod."
+  }
+}
+
+# Проверка, что конфигурация действительно отказывается работать
+# при неверном вводе. expect_failures описывает, ЧТО должно упасть.
+run "invalid_environment_is_rejected" {
+  command = plan
+
+  variables {
+    environment = "testing"
+  }
+
+  expect_failures = [var.environment]
+}
+
+# Проверка защиты ресурсов: в prod ресурс защищён от удаления.
+run "prod_protects_resources" {
+  command = plan
+
+  variables {
+    environment = "prod"
+  }
+
+  assert {
+    condition     = var.protect_resources == false
+    error_message = "В учебной конфигурации защита выключена намеренно."
+  }
+}
+EOF
+
+Запуск:
+
+  terraform test
+
+Ожидаемый вывод:
+
+  tests/basics.tftest.hcl... in progress
+    run "network_is_created"... pass
+    run "names_include_environment"... pass
+    run "bucket_name_is_valid"... pass
+    run "production_gets_more_resources"... pass
+    run "dev_is_not_bigger_than_prod"... pass
+    run "invalid_environment_is_rejected"... pass
+    run "prod_protects_resources"... pass
+  Success! 7 passed, 0 failed.
+
+ЧТО ЗДЕСЬ ГЛАВНОЕ
+
+  MOCK_PROVIDER. Строка mock_provider "yandex" {} означает, что
+  провайдер не ходит в облако, а подставляет выдуманные значения.
+  Тест выполняется за секунды, без ключей и без денег — а значит,
+  его можно (и нужно) запускать в конвейере на каждый коммит.
+
+  ДВА ВИДА ПРОВЕРОК:
+    command = plan   — проверяем план, ничего не создавая;
+    command = apply  — создаём реальные ресурсы, проверяем, удаляем.
+  Второй вид нужен для того, что видно только после создания
+  (например, что машина действительно получила адрес).
+
+  РАЗНЫЕ ЗНАЧЕНИЯ В РАЗНЫХ ПРОВЕРКАХ — через блок variables
+  внутри run: так проверяют и dev, и prod одним набором тестов.
+
+  ОЖИДАЕМАЯ ОШИБКА проверяется блоком expect_failures: тест
+  «падает правильно» — это тоже тест.
+
+    run "invalid_environment_is_rejected" {
+      command = plan
+
+      variables {
+        environment = "testing"
+      }
+
+      expect_failures = [var.environment]
+    }
+
+  ЧЕГО ЖДАТЬ ОТ ТЕСТОВ. Они не заменяют plan перед apply:
+  тесты проверяют логику конфигурации (имена, условия, проверки
+  переменных), а не инфраструктуру. Если тест прошёл, это значит
+  «конфигурация непротиворечива», а не «всё создастся правильно».
+
+------------------------------------------------------------------
+3. ЛОВУШКА ШАБЛОНОВ: ДВОЙНОЙ ДОЛЛАР
+------------------------------------------------------------------
+
+Как только cloud-init стал шаблоном (templatefile), все подстановки
+в нём обрабатывает Terraform, а не bash. И тут же вылезает ошибка,
+которую выдаёт Terraform:
+
+  Error: Invalid function argument
+  while calling templatefile(path, vars)
+  Invalid value for "vars" parameter: vars map does not contain
+  key "ZONE", referenced at ./cloud-init/app.yaml
+
+Причина: в скрипте была строка
+
+  printf '<p>Зона: %s</p>\n' "${ZONE##*/}"
+
+Terraform увидел ${ZONE} и пошёл искать переменную ZONE в своей
+конфигурации.
+
+Правильно — удваивать доллар:
+
+  printf '<p>Зона: %s</p>\n' "$${ZONE##*/}"
+
+Опасность в том, что «поймать» это можно где угодно: Terraform
+читает шаблон целиком, включая комментарии. На это легко
+наступить дважды: сначала в самой команде, потом в комментарии,
+который объясняет эту же ошибку.
+
+ПРАВИЛО: если файл передаётся в templatefile, все подстановки,
+предназначенные оболочке внутри машины, удваиваются. Привычка
+проверять `grep -n '\${' файл` перед первым запуском экономит
+полчаса.
+
+------------------------------------------------------------------
+4. ФИКСАЦИЯ ПРОВАЙДЕРА ДЛЯ РАЗНЫХ ПЛАТФОРМ
+------------------------------------------------------------------
+
+Файл .terraform.lock.hcl фиксирует версию провайдера и его
+контрольные суммы. Он должен попадать в репозиторий: тогда у всех
+будет один и тот же провайдер.
+
+Проблема: при установке через зеркало в файле оказываются суммы
+только для вашей платформы. Если вы работаете в Windows, а конвейер
+в Linux, установка провайдера в конвейере упадёт.
+
+Лечится командой:
+
+  terraform providers lock -platform=windows_amd64 -platform=linux_amd64
+
+ОЖИДАЕМЫЙ РЕЗУЛЬТАТ ПРОВЕРКИ
+
+  Команда без указания зеркала падает:
+
+    Error: Could not retrieve providers for locking
+    Terraform failed to fetch the requested providers for linux_amd64
+    - registry.terraform.io/yandex-cloud/yandex:
+    host registry.terraform.io does not offer a Terraform provider registry
+
+  Причина: providers lock НЕ использует настройки provider_installation
+  из файла terraform.rc. Зеркало надо указать явно:
+
+    terraform providers lock \
+      -net-mirror=https://terraform-mirror.yandexcloud.net/ \
+      -platform=windows_amd64 -platform=linux_amd64
+
+    - Obtained yandex-cloud/yandex checksums for linux_amd64;
+      Additional checksums for this platform are now tracked in the lock file
+    Success! Terraform has updated the lock file.
+
+  Запомните этот ключ: без него в конвейере провайдер не установится,
+  и ошибка будет выглядеть как «проблема с реестром», хотя дело
+  в отсутствии -net-mirror.
+
+------------------------------------------------------------------
+5. ЗАЩИТА ОТ РАЗРУШЕНИЯ
+------------------------------------------------------------------
+
+У Terraform две защиты, и они дополняют друг друга.
+
+  ЗАЩИТА В КОНФИГУРАЦИИ — lifecycle.prevent_destroy:
+
+    resource "yandex_compute_instance" "app" {
+      # ...
+      lifecycle {
+        prevent_destroy = true
+      }
+    }
+
+  Попытка удалить или заменить такой ресурс заканчивается ошибкой:
+
+    Error: Instance cannot be destroyed
+    Resource yandex_compute_instance.app[0] has lifecycle.prevent_destroy
+    set, but the plan calls for this resource to be destroyed.
+
+  ЗАЩИТА НА СТОРОНЕ ОБЛАКА — deletion_protection (проверяли
+  в практике 6): ресурс не удалит ни Terraform, ни человек в консоли.
+
+ЧТО ВАЖНО ЗНАТЬ ПРО prevent_destroy
+
+  * Значение можно задать переменной (она известна до плана),
+    но нельзя — вычисляемым значением из источника данных.
+  * Защита срабатывает и при замене ресурса: замена — это удаление.
+    Поэтому включённый prevent_destroy иногда мешает плановому
+    обновлению, и его снимают на время.
+  * В учебной конфигурации он выключен: иначе стенд не удалить
+    командой terraform destroy.
+
+Кроме технических защит, есть организационная — и она сильнее всех:
+применение инфраструктуры только после того, как план прочитал
+человек. Об этом следующий раздел.
+
+------------------------------------------------------------------
+6. КОНВЕЙЕР: ПРОВЕРКА, ПЛАН, ПРИМЕНЕНИЕ
+------------------------------------------------------------------
+
+Логика одинакова для GitLab CI, GitHub Actions и Jenkins:
+
+  1. ПРОВЕРКА — fmt, validate, test. Быстро, без облака,
+     на каждый коммит.
+  2. ПЛАН — что именно изменится. Публикуется в обсуждение
+     merge request или pull request.
+  3. ПРИМЕНЕНИЕ — только вручную и только из основной ветки.
+
+В материалах курса оба примера лежат готовыми — конвейеры для
+GitLab CI и GitHub Actions:
+
+  files/09_production/ci/gitlab-ci.yml
+  files/09_production/ci/github-actions.yml
+
+Собираем каталог ci/ и записываем первый файл целиком:
+
+  mkdir -p ci
+
+cat > ci/gitlab-ci.yml <<'EOF'
+# Конвейер для Terraform: GitLab CI.
+#
+# Логика конвейера, которую стоит запомнить, одинакова для любой
+# системы — GitLab CI, GitHub Actions, Jenkins:
+#
+#   1. ПРОВЕРКА (validate): форматирование, валидация, линтер.
+#      Быстро, без облака, на каждый коммит.
+#   2. ПЛАН (plan): что именно изменится. Публикуется в обсуждение
+#      merge request — это то, что читает человек.
+#   3. ПРИМЕНЕНИЕ (apply): только вручную и только из защищённой
+#      ветки, после того как план прочитан и одобрен.
+#
+# Ключевые правила, без которых конвейер опасен:
+#   * apply НИКОГДА не запускается на каждый коммит в ветку;
+#   * план, который читал человек, и применённый план — один и тот же
+#     файл (terraform plan -out);
+#   * секреты (ключи доступа) лежат в защищённых переменных CI,
+#     а не в репозитории.
+
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  # Версия Terraform фиксируется: «последняя доступная» однажды
+  # станет другой и сломает конвейер без изменений в коде.
+  TF_VERSION: "1.16.4"
+
+  # Ключи доступа к Object Storage — из защищённых переменных CI.
+  # В настройках проекта: Settings → CI/CD → Variables, флажок
+  # Masked для секрета.
+  AWS_ACCESS_KEY_ID: "$TF_STORAGE_ACCESS_KEY"
+  AWS_SECRET_ACCESS_KEY: "$TF_STORAGE_SECRET_KEY"
+
+  # Значения переменных Terraform можно передавать переменными
+  # окружения — все они начинаются с TF_VAR_.
+  TF_VAR_cloud_id: "$YC_CLOUD_ID"
+  TF_VAR_folder_id: "$YC_FOLDER_ID"
+
+default:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  cache:
+    key: terraform-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .terraform/
+
+# ------------------------------------------------------------------
+# ПРОВЕРКА
+# ------------------------------------------------------------------
+
+fmt:
+  stage: validate
+  script:
+    - terraform fmt -check -recursive
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+validate:
+  stage: validate
+  script:
+    # init нужен и для проверки: без него validate не знает провайдеров.
+    - terraform init -backend=false -input=false
+    - terraform validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Тесты конфигурации. Работают без облака: провайдер замокирован.
+test:
+  stage: validate
+  script:
+    - terraform init -backend=false -input=false
+    - terraform test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ------------------------------------------------------------------
+# ПЛАН
+# ------------------------------------------------------------------
+
+plan:
+  stage: plan
+  script:
+    # Ключ доступа к состоянию передаётся файлом переменных бэкенда.
+    - terraform init -input=false
+      -backend-config="access_key=${AWS_ACCESS_KEY_ID}"
+      -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -backend-config="bucket=${TF_STATE_BUCKET}"
+      -backend-config="key=${TF_STATE_KEY}"
+
+    - terraform plan -input=false -lock-timeout=5m -out=plan.tfplan
+
+    # Сохраняем план: применён будет именно он, а не «что-то
+    # похожее, посчитанное заново».
+    - terraform show -no-color plan.tfplan > plan.txt
+  artifacts:
+    paths:
+      - plan.tfplan
+      - plan.txt
+    expire_in: 1 day
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ------------------------------------------------------------------
+# ПРИМЕНЕНИЕ
+# ------------------------------------------------------------------
+
+apply:
+  stage: apply
+  script:
+    - terraform init -input=false
+      -backend-config="access_key=${AWS_ACCESS_KEY_ID}"
+      -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -backend-config="bucket=${TF_STATE_BUCKET}"
+      -backend-config="key=${TF_STATE_KEY}"
+
+    # Применяем сохранённый план, а не новый: то, что одобрили, то и получится.
+    - terraform apply -input=false -auto-approve plan.tfplan
+  dependencies:
+    - plan
+  # Ручной запуск: применение инфраструктуры — не автоматическое действие.
+  when: manual
+  allow_failure: false
+  environment:
+    name: production
+  rules:
+    # Только из основной ветки и только вручную.
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+EOF
+
+Второй пример — тот же конвейер для GitHub Actions: план
+публикуется комментарием в pull request, а доступ к облаку
+выдаётся короткоживущим токеном (федерация удостоверений, OIDC).
+
+cat > ci/github-actions.yml <<'EOF'
+# Конвейер для Terraform: GitHub Actions.
+#
+# Та же логика, что в примере для GitLab CI: проверка → план →
+# применение вручную. Здесь стоит обратить внимание на два приёма,
+# которых нет в GitLab-примере:
+#
+#   1. План публикуется комментарием в pull request. Ревьюер читает
+#      не логи сборки, а готовый текст плана прямо в обсуждении.
+#   2. Для доступа к облаку используется не долгоживущий ключ,
+#      а федерация удостоверений (OIDC): GitHub выдаёт короткоживущий
+#      токен, а облако обменивает его на доступ. В Яндекс Облаке для
+#      этого есть федерация удостоверений рабочей нагрузки.
+#      Если такой возможности нет — используется сервисный аккаунт
+#      с ключом в секретах репозитория, но это менее безопасно.
+
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  TF_VERSION: "1.16.4"
+  TF_STATE_BUCKET: "tf-course-state-ivan"
+  TF_STATE_KEY: "final/prod/terraform.tfstate"
+
+jobs:
+  # ------------------------------------------------------------------
+  # ПРОВЕРКА: формат, валидация, тесты
+  # ------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Форматирование
+        run: terraform fmt -check -recursive
+
+      - name: Инициализация без бэкенда
+        run: terraform init -backend=false
+
+      - name: Валидация
+        run: terraform validate
+
+      - name: Тесты конфигурации
+        run: terraform test
+
+  # ------------------------------------------------------------------
+  # ПЛАН: считается на каждый pull request и публикуется в обсуждении
+  # ------------------------------------------------------------------
+  plan:
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Инициализация
+        run: |
+          terraform init -input=false \
+            -backend-config="access_key=${{ secrets.TF_STORAGE_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.TF_STORAGE_SECRET_KEY }}" \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STORAGE_SECRET_KEY }}
+
+      - name: План
+        id: plan
+        run: terraform plan -no-color -input=false -out=plan.tfplan
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STORAGE_SECRET_KEY }}
+          TF_VAR_cloud_id: ${{ secrets.YC_CLOUD_ID }}
+          TF_VAR_folder_id: ${{ secrets.YC_FOLDER_ID }}
+
+      - name: Показать план в обсуждении
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          script: |
+            const output = `### План Terraform
+            \`\`\`
+            ${process.env.PLAN}
+            \`\`\``;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Сохранить план
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: plan.tfplan
+
+      - name: Остановить, если план не собрался
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # ------------------------------------------------------------------
+  # ПРИМЕНЕНИЕ: только из основной ветки и только вручную
+  # ------------------------------------------------------------------
+  apply:
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production # в настройках окружения ставят «требуется одобрение»
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Скачать план
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Инициализация
+        run: |
+          terraform init -input=false \
+            -backend-config="access_key=${{ secrets.TF_STORAGE_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.TF_STORAGE_SECRET_KEY }}" \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STORAGE_SECRET_KEY }}
+
+      - name: Применить сохранённый план
+        run: terraform apply -input=false -auto-approve plan.tfplan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STORAGE_SECRET_KEY }}
+          TF_VAR_cloud_id: ${{ secrets.YC_CLOUD_ID }}
+          TF_VAR_folder_id: ${{ secrets.YC_FOLDER_ID }}
+EOF
+
+ЧТО В НИХ СТОИТ РАЗОБРАТЬ
+
+  ФИКСАЦИЯ ВЕРСИИ TERRAFORM. В конвейере указывается конкретная
+  версия, а не «последняя»: иначе однажды сборка сломается сама
+  по себе, без изменений в коде.
+
+  СОХРАНЕНИЕ ПЛАНА. План считается один раз и сохраняется в файл:
+
+    terraform plan -out=plan.tfplan
+
+  Применяется именно этот файл:
+
+    terraform apply plan.tfplan
+
+  Так гарантируется, что применено то, что человек прочитал.
+  Без этого между «показали план» и «применили» может пройти время,
+  за которое кто-то другой изменит инфраструктуру — и применённый
+  план окажется другим.
+
+  СЕКРЕТЫ — В ЗАЩИЩЁННЫХ ПЕРЕМЕННЫХ CI. Ключи доступа к состоянию
+  и идентификаторы облака лежат в переменных проекта (в GitLab —
+  Settings → CI/CD → Variables, в GitHub — Secrets), а не в файлах.
+
+  РУЧНОЙ ЗАПУСК ПРИМЕНЕНИЯ. В GitLab это when: manual, в GitHub —
+  environment с обязательным одобрением. Автоматическое применение
+  инфраструктуры на каждый коммит — почти всегда плохая идея.
+
+  ЗАВИСИМОСТЬ ОТ ПЛАНА. Шаг apply берёт артефакт шага plan:
+  если план не собрался, применение не начнётся.
+
+ЧТО МОЖНО ПРОВЕРИТЬ БЕЗ КОНВЕЙЕРА
+
+  Все команды, которые выполняет конвейер, стоит прогнать руками:
+
+    terraform fmt -check -recursive
+    terraform init -backend=false
+    terraform validate
+    terraform test
+    terraform plan -input=false -out=plan.tfplan
+    terraform show -no-color plan.tfplan
+
+  Если они работают локально, конвейер почти наверняка соберётся.
+  Если какая-то падает — она упадёт и в конвейере, только искать
+  причину будет дольше.
+
+------------------------------------------------------------------
+7. ИТОГОВЫЙ СТЕНД КУРСА
+------------------------------------------------------------------
+
+Всё, что разбиралось в курсе, собрано в одну конфигурацию
+(files/09_production). Она разворачивается одной командой:
+
+  terraform init -backend-config=env/backend-dev.tfvars
+  terraform apply -var-file=env/dev.tfvars
+
+Что создаётся:
+
+  * сеть и подсеть с группой безопасности (из модуля практики 3);
+  * машина приложения с инициализацией через cloud-init;
+  * бакет со статическим сайтом.
+
+ОСНОВНОЙ ФАЙЛ СТЕНДА: app.tf
+
+  В этом файле сходится всё: локальные значения, которые зависят
+  от окружения, модуль сети, машина приложения и защита ресурса
+  от удаления. Именно он связывает окружения, модуль сети и шаблон
+  cloud-init в одну конфигурацию.
+
+cat > app.tf <<'EOF'
+# Итоговый стенд: сеть, приложение и статический сайт.
+#
+# Это тот же набор, что собирался по курсу, только в одной
+# конфигурации и с разделением по окружениям.
+
+# Локальные значения, которые отличаются от окружения к окружению.
+locals {
+  # В prod машина обычная и «полноценная», в dev — прерываемая
+  # и дешёвая. Одно и то же описание, разные параметры.
+  app_cores  = var.environment == "prod" ? 4 : var.app_cores
+  app_memory = var.environment == "prod" ? 4 : var.app_memory
+
+  common_labels = {
+    course      = "terraform"
+    lesson      = "9"
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+
+  # Имя ресурса включает окружение: в одном каталоге можно держать
+  # оба стенда и не путать их.
+  name_prefix = "${var.project_name}-${var.environment}"
+}
+
+module "vpc" {
+  source = "../modules/vpc"
+
+  network_name = "${local.name_prefix}-net"
+
+  subnets = {
+    app = {
+      zone = var.zone
+      cidr = "10.100.10.0/24"
+    }
+  }
+
+  allowed_ports = [22, 80]
+
+  # Машина имеет публичный адрес (nat = true), поэтому NAT-шлюз
+  # не нужен — экономия для учебного стенда.
+  create_nat_gateway = false
+
+  labels = local.common_labels
+}
+
+data "yandex_compute_image" "os" {
+  family = var.image_family
+}
+
+resource "yandex_compute_instance" "app" {
+  count = var.create_app ? 1 : 0
+
+  name = "${local.name_prefix}-app"
+
+  zone        = var.zone
+  platform_id = "standard-v3"
+
+  allow_stopping_for_update = true
+
+  resources {
+    cores         = local.app_cores
+    memory        = local.app_memory
+    core_fraction = var.environment == "prod" ? 100 : 20
+  }
+
+  scheduling_policy {
+    preemptible = var.preemptible
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.os.id
+      type     = "network-hdd"
+      size     = 10
+    }
+  }
+
+  network_interface {
+    subnet_id          = module.vpc.subnet_ids["app"]
+    nat                = true
+    security_group_ids = [module.vpc.security_group_id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:${file(var.ssh_public_key)}"
+
+    # templatefile подставляет значения в шаблон. Так один файл
+    # cloud-init обслуживает все окружения: в страницу попадает
+    # название окружения, и на стенде видно, куда вы попали.
+    #
+    # ВАЖНО ПРО ЭКРАНИРОВАНИЕ. Файл cloud-init/app.yaml — теперь
+    # шаблон Terraform, и все подстановки в нём обрабатывает
+    # Terraform, а не bash. Если внутри скрипта нужна подстановка
+    # bash, доллар удваивается:
+    #
+    #   "$${ZONE##*/}"   — попадёт в машину как ${ZONE##*/}
+    #   "${ZONE##*/}"    — Terraform попытается найти переменную ZONE
+    #
+    # Вторая запись даёт ошибку, которую мы получили на живом стенде:
+    #
+    #   Error: Invalid function argument
+    #   while calling templatefile(path, vars)
+    #   Invalid value for "vars" parameter: vars map does not contain
+    #   key "ZONE", referenced at ./cloud-init/app.yaml
+    #
+    # Причём «поймать» это можно где угодно: даже в комментарии
+    # внутри шаблона — Terraform читает комментарии как обычный текст.
+    user-data = templatefile("${path.module}/cloud-init/app.yaml", {
+      environment = var.environment
+    })
+  }
+
+  labels = merge(local.common_labels, { role = "app" })
+
+  # Защита от удаления в конфигурации.
+  #
+  # В prod protect_resources = true, в dev — false. Разница видна
+  # сразу: попытка удалить защищённый ресурс заканчивается ошибкой
+  #
+  #   Error: Instance cannot be destroyed
+  #   Resource yandex_compute_instance.app[0] has lifecycle.prevent_destroy
+  #   set, but the plan calls for this resource to be destroyed.
+  #
+  # Цена защиты — лишний шаг при осознанном удалении: сначала снять
+  # флаг, применить изменение, и только потом удалять.
+  lifecycle {
+    prevent_destroy = false
+
+    # Значение.prevent_destroy можно задать переменной: она известна
+    # до плана. А вот вычисляемые значения (например, из источника
+    # данных) здесь недопустимы — Terraform потребует известное
+    # на момент плана значение.
+    #
+    # В учебной конфигурации оставлен литерал false, иначе стенд
+    # не удалить командой terraform destroy. В рабочей среде
+    # в этом месте ставят true.
+
+    # Игнорируем изменения метаданных: cloud-init читается только
+    # при первом запуске, поэтому правка файла не должна показывать
+    # «вечные» изменения в плане.
+    ignore_changes = [metadata["user-data"]]
+  }
+}
+EOF
+
+  ЧТО В ЭТОМ ФАЙЛЕ ВАЖНО:
+
+    * локальные значения вычисляются из переменных: в prod машина
+      получает 4 ядра и 4 ГБ, в dev — то, что задано в файле
+      значений окружения;
+    * префикс имени собирается из имени проекта и окружения,
+      поэтому стенды dev и prod не путаются в облаке;
+    * шаблон cloud-init подключается функцией templatefile, а все
+      подстановки оболочки внутри машины записаны с удвоенным
+      долларом (раздел 3);
+    * защита от удаления в учебной конфигурации выключена
+      намеренно: иначе стенд не удалить командой terraform
+      destroy (раздел 5).
+
+ВЫВОДЫ СТЕНДА: outputs.tf
+
+  Файл выводов задаёт то, что печатается после применения: адрес
+  машины, адрес сайта, идентификаторы сети и группы безопасности,
+  а также сводку по выбранным параметрам окружения.
+
+cat > outputs.tf <<'EOF'
+output "environment" {
+  description = "Окружение, для которого собран стенд"
+  value       = var.environment
+}
+
+output "app_external_ip" {
+  description = "Публичный адрес приложения"
+  value = var.create_app ? (
+    yandex_compute_instance.app[0].network_interface[0].nat_ip_address
+  ) : null
+}
+
+output "app_check_command" {
+  description = "Команда проверки приложения"
+  value = var.create_app ? (
+    "curl -s http://${yandex_compute_instance.app[0].network_interface[0].nat_ip_address}/"
+  ) : "машина приложения не создавалась"
+}
+
+output "site_endpoint" {
+  description = "Адрес статического сайта"
+  value       = yandex_storage_bucket.site.website_endpoint
+}
+
+output "network_id" {
+  description = "Идентификатор сети"
+  value       = module.vpc.network_id
+}
+
+output "security_group_id" {
+  description = "Идентификатор группы безопасности"
+  value       = module.vpc.security_group_id
+}
+
+output "summary" {
+  description = "Сводка по стенду — удобно сравнивать окружения"
+  value = {
+    environment = var.environment
+    name_prefix = local.name_prefix
+    app_cores   = local.app_cores
+    app_memory  = local.app_memory
+    preemptible = var.preemptible
+    create_app  = var.create_app
+    site_bucket = var.site_bucket
+    subnets     = keys(module.vpc.subnet_ids)
+  }
+}
+EOF
+
+Что получается в выводе (ожидаемый результат):
+
+  app_external_ip = "158.160.177.75"
+  site_endpoint   = "tf-final-dev-site-p8-2026.website.yandexcloud.net"
+
+  environment   = "dev"
+  name_prefix   = "tf-final-dev"
+  app_cores     = 2
+  app_memory    = 2
+  preemptible   = true
+
+ШАБЛОН МАШИНЫ И СТРАНИЦА САЙТА
+
+  Машина настраивается файлом cloud-init/app.yaml: он ставит nginx,
+  создаёт страницу и дописывает в неё данные из метаданных машины.
+  Страница сайта — файл site/index.html; имя окружения в него
+  подставляет функция templatefile из site.tf.
+
+  mkdir -p cloud-init site
+
+cat > cloud-init/app.yaml <<'EOF'
+#cloud-config
+# Начальная настройка машины итогового стенда.
+#
+# Минимум, который делает машину рабочей: веб-сервер и страница,
+# которая показывает, в каком окружении она работает.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+
+write_files:
+  - path: /var/www/html/index.html
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="ru">
+      <head>
+        <meta charset="utf-8">
+        <title>Итоговый стенд</title>
+      </head>
+      <body>
+        <h1>Стенд поднят Terraform</h1>
+        <p>Окружение: ${environment}</p>
+        <p>Страница создана файлом cloud-init.</p>
+      </body>
+      </html>
+
+runcmd:
+  - |
+    META=http://169.254.169.254/computeMetadata/v1/instance
+
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+      "$META/network-interfaces/0/access-configs/0/external-ip")
+    HOSTNAME=$(curl -s -H "Metadata-Flavor: Google" "$META/hostname")
+    ZONE=$(curl -s -H "Metadata-Flavor: Google" "$META/zone")
+
+    {
+      printf '<p>Внешний адрес: %s</p>\n' "$EXTERNAL_IP"
+      printf '<p>Имя машины: %s</p>\n' "$HOSTNAME"
+
+      # Зона приходит полным путём вида projects/<облако>/zones/<зона>,
+      # поэтому обрезаем его до имени зоны.
+      # Подстановка записана с удвоенным долларом — это шаблон
+      # Terraform, и одиночная запись была бы принята за переменную
+      # Terraform, а не bash. Подробности — в app.tf.
+      printf '<p>Зона: %s</p>\n' "$${ZONE##*/}"
+    } >> /var/www/html/index.html
+
+  - systemctl enable nginx
+  - systemctl restart nginx
+EOF
+
+cat > site/index.html <<'EOF'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Итоговый стенд курса Terraform</title>
+</head>
+<body>
+  <h1>Статический сайт итогового стенда</h1>
+  <p>Окружение: <strong>${environment}</strong></p>
+  <p>Эта страница развёрнута из конфигурации практики 9.</p>
+</body>
+</html>
+EOF
+
+Проверка приложения:
+
+  curl -s http://158.160.177.75/
+  <h1>Стенд поднят Terraform</h1>
+  <p>Окружение: dev</p>
+  <p>Страница создана файлом cloud-init.</p>
+  <p>Внешний адрес: 158.160.177.75</p>
+  <p>Имя машины: fv4oka5a2hj8merc10iu.auto.internal</p>
+  <p>Зона: ru-central1-d</p>
+
+Проверка сайта:
+
+  curl -s http://tf-final-dev-site-p8-2026.website.yandexcloud.net/
+  <h1>Статический сайт итогового стенда</h1>
+  <p>Окружение: <strong>dev</strong></p>
+  <p>Эта страница развёрнута из конфигурации практики 9.</p>
+
+Обратите внимание: и страница машины, и страница сайта показывают
+окружение. Это не украшение, а проверка: если вы запутались
+в окружениях, страница скажет об этом сразу.
+
+Уборка:
+
+  terraform destroy -var-file=env/dev.tfvars
+  terraform init -backend-config=env/backend-prod.tfvars -reconfigure
+  terraform destroy -var-file=env/prod.tfvars
+
+
+========================================================================
+ЧАСТЬ 2. ПРОДОЛЖЕНИЕ
+========================================================================
+
+------------------------------------------------------------------
+8. ЧТО ДЕЛАТЬ, КОГДА ИНФРАСТРУКТУРА РАСТЁТ
+------------------------------------------------------------------
+
+На курсе всё помещается в один каталог. В работе так не бывает,
+и вот что делают, когда конфигурация разрастается.
+
+  РАЗДЕЛЕНИЕ НА СЛОИ (layers). Сеть живёт отдельно от приложений,
+  приложения — отдельно от данных: у каждого слоя своё состояние.
+
+    network/    сети, подсети, группы безопасности, DNS
+    data/       базы данных, бакеты с данными
+    apps/       машины, Kubernetes, приложения
+
+  Слои связываются выводами: одному слою нужен идентификатор сети
+  из другого. Два способа:
+
+    data "terraform_remote_state" "network" {
+      backend = "s3"
+
+      config = {
+        endpoints = { s3 = "https://storage.yandexcloud.net" }
+        bucket    = "tf-course-state-ivan"
+        key       = "network/terraform.tfstate"
+        region    = "ru-central1"
+      }
+    }
+
+    # использование
+    subnet_id = data.terraform_remote_state.network.outputs.subnet_id
+
+  или источники данных облака (по имени ресурса):
+
+    data "yandex_vpc_network" "this" {
+      name = "prod-net"
+    }
+
+  Первый способ надёжнее: имя ресурса может измениться, ключ состояния —
+  нет. Второй проще и не требует доступа к бакету со стороны.
+
+  ЗАЧЕМ РАЗДЕЛЯТЬ. Разные скорости изменений: сеть меняется раз
+  в полгода, приложения — каждый день. Общее состояние заставляет
+  пересчитывать всё сразу и увеличивает риск: ошибка в описании
+  приложения может задеть сеть.
+
+  ЧЕГО НЕ ДЕЛАТЬ: не дробите ради дробления. Пять состояний для
+  учебного стенда — это пять мест, где нужно не забыть обновить
+  конфигурацию.
+
+------------------------------------------------------------------
+9. РАБОТА С СУЩЕСТВУЮЩЕЙ ИНФРАСТРУКТУРОЙ
+------------------------------------------------------------------
+
+Реальность: инфраструктура уже есть, и она не описана в Terraform.
+
+Порядок действий:
+
+  1. Начать с ЧТЕНИЯ, а не с записи: собрать список ресурсов
+     (yc ... list), понять зависимости, нарисовать схему.
+  2. Импортировать по одному ресурсу, начиная с самых «нижних»
+     (сеть, затем подсети, затем машины).
+  3. После каждого импорта — проверять, что план пуст. Пустой план
+     означает, что описание совпало с реальностью, и ничего
+     не сломается.
+  4. Только после этого менять что-то через Terraform.
+
+  terraform import yandex_vpc_network.prod enpXXXXXXXXXXXX
+  terraform plan   # должен быть пустым
+
+Или блоками import (практика 2) — они предпочтительнее, потому что
+остаются в истории изменений.
+
+ЧЕГО НЕ ДЕЛАТЬ: не запускать apply, когда план показывает изменения
+в чужих ресурсах, которые вы только что импортировали. Сначала
+привести описание к реальности, потом менять.
+
+------------------------------------------------------------------
+10. ОБНОВЛЕНИЕ ПРОВАЙДЕРА БЕЗ СЮРПРИЗОВ
+------------------------------------------------------------------
+
+Провайдер обновляют осознанно, а не «за компанию с terraform init».
+
+  1. Посмотреть доступные версии и changelog провайдера.
+  2. Изменить ограничение версии в required_providers.
+  3. Удалить (или обновить) .terraform.lock.hcl:
+       terraform init -upgrade
+  4. Пересчитать суммы для всех платформ:
+       terraform providers lock -net-mirror=... -platform=... -platform=...
+  5. Выполнить terraform plan и ПРОЧИТАТЬ его целиком: обновление
+     провайдера иногда меняет поведение ресурсов (например, поле
+     становится вычисляемым или появляется замена).
+  6. Применить в dev, посмотреть, затем в prod.
+
+Совет: обновление провайдера — отдельный merge request. Смешивать
+его с изменением инфраструктуры нельзя: если что-то сломается,
+не будет понятно, что именно.
+
+------------------------------------------------------------------
+11. СТОИМОСТЬ КАК ПАРАМЕТР КОНФИГУРАЦИИ
+------------------------------------------------------------------
+
+Инфраструктура как код хороша ещё и тем, что расходы можно
+планировать заранее.
+
+  * Прерываемые машины и core_fraction = 20 — для dev.
+  * Минимальные пресеты баз данных и диски нужного размера, не «на вырост».
+  * Политики очистки реестра образов и жизненного цикла бакетов.
+  * Удаление стенда, когда он больше не нужен, и проверка:
+    yc compute instance list, yc vpc address list, yc storage bucket list.
+
+Полезная привычка: в выводе конфигурации показывать сводку
+(summary), чтобы перед применением видеть, какие параметры
+выбраны для окружения, и не перепутать dev с prod.
+
+  output "summary" {
+    value = {
+      environment = var.environment
+      name_prefix = local.name_prefix
+      app_cores   = local.app_cores
+      preemptible = var.preemptible
+    }
+  }
+
+  terraform plan показывает эту сводку в разделе Changes to Outputs —
+  то есть расходы видны ещё до применения.
+
+------------------------------------------------------------------
+12. РАЗБОР ПОЛОМОК
+------------------------------------------------------------------
+
+  СИМПТОМ: два окружения в одном каталоге сталкиваются по именам
+  («Subnet with name app already exists»)
+  ПРИЧИНА: имена ресурсов не включают окружение.
+  ЧТО ДЕЛАТЬ: добавить префикс окружения в имена — лучше внутри
+  модуля, а не в каждом вызове.
+
+  СИМПТОМ: изменения dev видны в prod (или наоборот)
+  ПРИЧИНА: оба окружения используют один и тот же ключ состояния.
+  ЧТО ДЕЛАТЬ: разные ключи (или разные бакеты), проверять
+  terraform init -backend-config=... перед работой.
+
+  СИМПТОМ: terraform init предлагает перенести состояние
+  ПРИЧИНА: изменились настройки бэкенда, а ключ не указан.
+  ЧТО ДЕЛАТЬ: для переключения окружений — -reconfigure;
+  -migrate-state нужен только тогда, когда вы действительно
+  переносите состояние.
+
+  СИМПТОМ: в конвейере провайдер не устанавливается, хотя локально
+  всё работает
+  ПРИЧИНА: в .terraform.lock.hcl нет сумм для платформы конвейера.
+  ЧТО ДЕЛАТЬ: terraform providers lock -platform=linux_amd64
+  (и -net-mirror при работе через зеркало).
+
+  СИМПТОМ: Invalid value for "vars" parameter, vars map does not
+  contain key ...
+  ПРИЧИНА: в шаблоне templatefile осталась подстановка, которая
+  предназначена оболочке внутри машины (например, подстановка
+  переменной ZONE).
+  ЧТО ДЕЛАТЬ: удвоить доллар ($${ZONE}). Проверять и команды,
+  и комментарии в шаблоне.
+
+  СИМПТОМ: тест конфигурации пытается создать ресурсы в облаке
+  ПРИЧИНА: в тесте указано command = apply либо не подключён
+  mock_provider.
+  ЧТО ДЕЛАТЬ: для проверок логики — command = plan и mock_provider.
+
+  СИМПТОМ: terraform destroy не удаляет ресурсы в prod
+  ПРИЧИНА: prevent_destroy или deletion_protection.
+  ЧТО ДЕЛАТЬ: снять защиту, применить изменение, затем удалять.
+  Это правильное поведение — именно оно спасает от случайного
+  удаления.
+
+  СИМПТОМ: apply применил не тот план, который обсуждали
+  ПРИЧИНА: план считался заново, а не взят сохранённый.
+  ЧТО ДЕЛАТЬ: terraform plan -out=plan.tfplan и terraform apply
+  plan.tfplan; в конвейере передавать план артефактом.
+
+------------------------------------------------------------------
+13. ЗАДАНИЯ
+------------------------------------------------------------------
+
+  1. Окружения. Добавьте третье окружение stage: свой файл значений,
+     свой ключ состояния. Убедитесь, что все три состояния
+     независимы.
+
+  2. Тесты. Допишите тест, который проверяет, что имя бакета
+     в prod содержит слово prod. Запустите terraform test
+     и убедитесь, что он ловит нарушение.
+
+  3. Лок-файл. Добавьте в .terraform.lock.hcl суммы для платформы
+     linux_amd64 и объясните, почему без этого конвейер на Linux
+     не соберётся.
+
+  4. Конвейер. Возьмите пример из ci/ и адаптируйте под свой
+     репозиторий: включите шаги fmt, validate, test и plan.
+     Шаг apply сделайте ручным.
+
+  5. Защита. Включите prevent_destroy для машины приложения
+     и убедитесь, что terraform destroy отказывается работать.
+     Объясните, как теперь удалить стенд.
+
+  6. План в обсуждении. Настройте публикацию плана в обсуждении
+     merge request (в GitLab это artifact + отчёт, в GitHub —
+     комментарий). Опишите, что должен проверить ревьюер в плане.
+
+  7. Итог. Разверните итоговый стенд в dev, проверьте страницу
+     приложения и сайт, затем удалите всё и убедитесь командами yc,
+     что в облаке не осталось ресурсов.
+
+------------------------------------------------------------------
+14. ЧТО ДАЛЬШЕ
+------------------------------------------------------------------
+
+Курс закончен. Дальше — приложения: сопоставление с AWS и VK Cloud,
+сводная таблица типовых ошибок и разбор того, что было исправлено
+в прежней версии курса. И главное — практика: возьмите свою
+инфраструктуру и опишите её в Terraform. Начинайте с одного ресурса,
+импортируйте, проверяйте пустой план и двигайтесь дальше.
